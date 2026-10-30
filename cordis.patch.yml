@@ -1,0 +1,4 @@
+# 挂载宿主插件；浏览器模块由 package.json 的 dsh.client 声明加载。
+- insert:
+    - id: dsh-phone-mirror
+      name: dsh-phone-mirror

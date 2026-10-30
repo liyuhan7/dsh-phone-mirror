@@ -1,0 +1,64 @@
+{
+  "name": "dsh-phone-mirror",
+  "version": "0.1.0",
+  "description": "把安卓手机/平板投到 DSH 右侧栏，并用鼠标键盘反控：scrcpy 内核，浏览器端 WebCodecs 解码",
+  "type": "module",
+  "license": "MIT",
+  "author": "",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "android",
+    "scrcpy",
+    "mirror",
+    "remote-control",
+    "harmonyos"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OWNER/dsh-phone-mirror.git"
+  },
+  "homepage": "https://github.com/OWNER/dsh-phone-mirror#readme",
+  "bugs": {
+    "url": "https://github.com/OWNER/dsh-phone-mirror/issues"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": { "default": "./lib/index.js" },
+    "./client": { "default": "./lib/client.bundle.js" },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "tools/scrcpy-server.jar",
+    "scripts/build-client.mjs",
+    "scripts/fetch-tools.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "THIRD-PARTY.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "build:check": "node scripts/build-client.mjs --check",
+    "check": "node --check lib/index.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && npm run build:check",
+    "fetch:tools": "node scripts/fetch-tools.mjs"
+  },
+  "dsh": {
+    "engines": { "dsh": ">=0.2.0-rc.1 <0.3.0-0" },
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-sidebar-right",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": ">=4.0.0 <5",
+    "@deepseek-ai/schemastery": ">=3.18.0 <4"
+  }
+}
