@@ -43,7 +43,7 @@
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "build:check": "node scripts/build-client.mjs --check",
-    "check": "node --check lib/index.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && node --check lib/audio-worklet.js && npm run build:check",
+    "check": "node --check lib/index.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && node --check lib/audio-worklet.js && node --check lib/engine.js && node --check lib/engine-worker.js && npm run build:check",
     "fetch:tools": "node scripts/fetch-tools.mjs"
   },
   "dsh": {
