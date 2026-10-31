@@ -16,6 +16,7 @@
 
 - 侧栏「手机」页签，画面即点即控，可全屏
 - 鼠标点按 / 拖拽 / 滚轮，键盘输入；返回、Home、任务、电源、旋转、通知、音量
+- 声音一起转发（Opus 48kHz 立体声），面板上一键静音；设备拿不到音频时自动退回无声会话
 - 画质档位：流畅（长边 720）/ 标准（1080）/ 高清（1600）
 - 设备选择，无线调试地址直连
 - scrcpy 起不来时自动降级到 `adb screencap` 截图模式，帧率低但几乎任何设备都能出画面
@@ -27,6 +28,7 @@
 - DSH `>= 0.2.0-rc.1 < 0.3.0`
 - Node.js 20+，只用于首次下载工具和构建，运行时不依赖
 - 设备：安卓 5.0+，或 HarmonyOS 4.x（**HarmonyOS NEXT / 5.x 没有 adb，不可用**）
+- 转发声音需要 Android 11+（`AudioPlaybackCapture`）；更低版本只投画面
 - 手机/平板已开启「开发者选项 → USB 调试」，并允许过这台电脑的调试授权
 
 实际验证环境：Windows 11 + HarmonyOS 4.2 平板（华为 MatePad Air，`BKY-W10`）。
@@ -90,11 +92,11 @@ DSH Desktop 的 `desktop` profile 由应用独占托管，`dsh plugin` 会拒绝
 | `screencapIntervalMs` | `260` | 降级模式的截图间隔 |
 | `adbPath` | 空 | 自定义 adb 路径，留空用插件自带的 |
 | `serverJar` | 空 | 自定义 `scrcpy-server.jar` 路径 |
-| `audio` | `false` | 预留开关，音频转发尚未完成，见下方限制 |
+| `audio` | `true` | 转发设备声音；设备不支持时自动跳过带音频的尝试，并在下次连接时直接无声开场 |
 
 ## 已知限制
 
-- **音频转发还没做完**，没有在任何设备上验证通过。配置项 `audio` 和面板上的喇叭按钮目前不起作用。
+- **音频**：需要 Android 11+。每个 App 可以声明自己不可被捕获，这类 App 只有画面没有声音；设备没有任何播放时收到的是静音帧，属于正常现象。
 - **DRM 内容**：付费视频类 App 通常输出黑屏，这是 `MediaCodec` 的安全视频通路，不是插件问题。
 - **HarmonyOS NEXT / 5.x** 没有 adb，无法使用。
 - **无线调试**：部分华为/荣耀机型没有「无线调试」入口，只能用 USB。
@@ -114,6 +116,9 @@ DSH Desktop 的 `desktop` profile 由应用独占托管，`dsh plugin` 会拒绝
 
 **画面卡住不动**
 链路断了面板会自动重连，解码器卡死会自己重建并向设备重新要关键帧，连续追不上帧时还会自动降一档画质。都不管用时点「重建画面」。静止画面下帧率显示个位数是正常的，设备不重绘就不出帧。
+
+**没有声音**
+先看面板上的喇叭按钮是不是灰的：灰色表示这个会话压根没拿到音频，去 `/dsh-phone-mirror/api/status` 看 `session.audio` 与 `session.audioCodec`。按钮可用却听不到，检查电脑音量、平板是否静音，以及正在播的那个 App 是否禁止被捕获。
 
 **`dsh plugin` 拒绝操作 desktop profile**
 desktop profile 由 Electron 应用独占托管，CLI 会拒绝写入。直接编辑该 profile 的 `package.json`，在 `dependencies` 里加 `"dsh-phone-mirror": "link:D:/path/to/dsh-phone-mirror"`，并把插件名加进 `dsh.profile.bundles`，然后在 profile 目录执行 `pnpm install`。
