@@ -4,7 +4,7 @@
   "description": "把安卓手机/平板投到 DSH 右侧栏，并用鼠标键盘反控：scrcpy 内核，浏览器端 WebCodecs 解码",
   "type": "module",
   "license": "MIT",
-  "author": "",
+  "author": "liyuhan7",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -17,11 +17,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/OWNER/dsh-phone-mirror.git"
+    "url": "git+https://github.com/liyuhan7/dsh-phone-mirror.git"
   },
-  "homepage": "https://github.com/OWNER/dsh-phone-mirror#readme",
+  "homepage": "https://github.com/liyuhan7/dsh-phone-mirror#readme",
   "bugs": {
-    "url": "https://github.com/OWNER/dsh-phone-mirror/issues"
+    "url": "https://github.com/liyuhan7/dsh-phone-mirror/issues"
   },
   "main": "lib/index.js",
   "exports": {
@@ -35,6 +35,7 @@
     "scripts/build-client.mjs",
     "scripts/fetch-tools.mjs",
     "cordis.patch.yml",
+    "docs",
     "README.md",
     "LICENSE",
     "THIRD-PARTY.md"
