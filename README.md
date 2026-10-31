@@ -112,6 +112,9 @@ DSH Desktop 的 `desktop` profile 由应用独占托管，`dsh plugin` 会拒绝
 **画面卡**
 先降画质档位，再看标题行帧率是否明显低于 60。同时确认 DSH 没有别的标签页在跑大流量。
 
+**画面卡住不动**
+链路断了面板会自动重连，解码器卡死会自己重建并向设备重新要关键帧，连续追不上帧时还会自动降一档画质。都不管用时点「重建画面」。静止画面下帧率显示个位数是正常的，设备不重绘就不出帧。
+
 **`dsh plugin` 拒绝操作 desktop profile**
 desktop profile 由 Electron 应用独占托管，CLI 会拒绝写入。直接编辑该 profile 的 `package.json`，在 `dependencies` 里加 `"dsh-phone-mirror": "link:D:/path/to/dsh-phone-mirror"`，并把插件名加进 `dsh.profile.bundles`，然后在 profile 目录执行 `pnpm install`。
 
