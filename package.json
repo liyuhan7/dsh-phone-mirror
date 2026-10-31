@@ -44,16 +44,17 @@
   ],
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+    "dsh": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-rc.1 <0.3.0-0"
   },
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "build:check": "node scripts/build-client.mjs --check",
     "check": "node --check lib/index.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && node --check lib/audio-worklet.js && node --check lib/engine.js && node --check lib/engine-worker.js && npm run build:check",
-    "fetch:tools": "node scripts/fetch-tools.mjs"
+    "fetch:tools": "node scripts/fetch-tools.mjs",
+    "prepublishOnly": "npm run check"
   },
   "dsh": {
-    "engines": { "dsh": ">=0.2.0-rc.1 <0.3.0-0" },
+    "engines": { "dsh": ">=0.2.0-rc.1 <0.2.1-0 || >=0.2.1-rc.1 <0.3.0-0" },
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
       "platform": "web",

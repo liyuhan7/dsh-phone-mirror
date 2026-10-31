@@ -16,6 +16,7 @@ Mirror an Android phone or tablet into the DSH right sidebar and control it with
 - **Audio forwarding**: Opus 48 kHz stereo through an AudioWorklet ring buffer, 80 ms startup buffer that grows to 240 ms on underrun; devices without capturable audio fall back to a silent session.
 - **Decoding on a worker thread**: the stream, H.264 decoding, drawing and audio decoding all run in a Worker, so DSH spending the main thread on chat rendering or file writes does not stall the panel; without a Worker it falls back to the main thread.
 - **Automatic fallback**: when scrcpy cannot start, the plugin polls `adb screencap` instead (260 ms per frame by default), which is slow but works on almost any device adb can reach.
+- **From cable to Wi-Fi**: the panel's "转无线" switches USB debugging to TCP and connects automatically, so you can unplug and keep mirroring; stock Android 11+ can also pair through Wireless debugging.
 
 Panel labels are Chinese only; the plugin does not ship translations yet.
 
@@ -34,6 +35,9 @@ Per-brand USB debugging instructions: [docs/debugging.md](docs/debugging.md) (Ch
 **Install**
 
 ```bash
+# npm package, prebuilt install
+dsh plugin --profile <profile> add dsh-phone-mirror
+# or straight from the repository
 dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 ```
 
@@ -51,6 +55,7 @@ npm run fetch:tools
 1. Restart DSH and add the "手机" tab from the right sidebar's "+"
 2. Pick your device at the top and click "连接"
 3. Accept "Allow USB debugging" on the device, with "Always allow" checked
+4. To drop the cable, press "转无线" at the bottom of the panel and unplug once it reports the wireless address
 
 **Expected result**: the panel shows the device screen and the caption reads `BKY-W10 · 1048×1600 · 30fps` (device · resolution · live fps).
 
@@ -61,7 +66,9 @@ click / drag / wheel    operate the device directly
 keyboard                click the screen to capture it; Esc releases focus
 fullscreen              the "全屏" toolbar button
 quality                 smooth 720 / standard 1080 / high 1600
-wireless debugging      enter 192.168.x.x:port at the bottom of the panel
+wireless                "转无线" switches USB to TCP and connects automatically
+pairing                 "配对" takes the pairing address and 6-digit code
+"断开连接"              drops the wireless channel only; USB is untouched
 ```
 
 If the picture is corrupted or black, press "重建画面": the decoder is dropped and the stream re-attached so the device sends a fresh keyframe.

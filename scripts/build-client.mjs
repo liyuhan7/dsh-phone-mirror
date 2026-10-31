@@ -9,7 +9,7 @@ const engineUrl = new URL('../lib/engine.js', import.meta.url)
 const outputUrl = new URL('../lib/client.bundle.js', import.meta.url)
 const MARKER = '//#inline ./engine.js'
 
-export function buildClientBundle() {
+function buildClientBundle() {
   const engine = readFileSync(engineUrl, 'utf8')
   const source = readFileSync(sourceUrl, 'utf8')
   if (!source.includes(MARKER)) throw new Error(`client.js 缺少 ${MARKER} 标记`)
@@ -18,17 +18,15 @@ export function buildClientBundle() {
   return `// 本文件由 npm run build 生成，请修改 lib/client.js 后重新构建。\n${inlined}`
 }
 
-if (process.argv[1]) {
-  const bundle = buildClientBundle()
-  if (process.argv.includes('--check')) {
-    let current = ''
-    try { current = readFileSync(outputUrl, 'utf8') } catch {}
-    if (current !== bundle) {
-      console.error('client.bundle.js 已过期，请运行 npm run build')
-      process.exitCode = 1
-    }
-  } else {
-    writeFileSync(outputUrl, bundle)
-    console.log(`已写入 ${fileURLToPath(outputUrl)}`)
+const bundle = buildClientBundle()
+if (process.argv.includes('--check')) {
+  let current = ''
+  try { current = readFileSync(outputUrl, 'utf8') } catch {}
+  if (current !== bundle) {
+    console.error('client.bundle.js 已过期，请运行 npm run build')
+    process.exitCode = 1
   }
+} else {
+  writeFileSync(outputUrl, bundle)
+  console.log(`已写入 ${fileURLToPath(outputUrl)}`)
 }
