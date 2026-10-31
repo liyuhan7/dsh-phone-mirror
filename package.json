@@ -36,10 +36,16 @@
     "scripts/fetch-tools.mjs",
     "cordis.patch.yml",
     "docs",
+    "screenshots.json",
     "README.md",
+    "README.en.md",
     "LICENSE",
     "THIRD-PARTY.md"
   ],
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0"
+  },
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "build:check": "node scripts/build-client.mjs --check",

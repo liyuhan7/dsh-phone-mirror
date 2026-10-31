@@ -1,5 +1,7 @@
 # dsh-phone-mirror
 
+[English](README.en.md) | 中文
+
 给用 DSH 的开发者：在右侧栏看安卓设备画面，并用鼠标键盘直接操作。
 
 ![页面示例](docs/example.png)
@@ -24,6 +26,8 @@
 - Node.js 20+（仅首次下载工具与构建时使用）
 - 安卓设备已开启「开发者选项 → USB 调试」并完成授权
 - 转发声音需要 Android 11+
+
+各品牌开启 USB 调试的入口和额外开关见 [docs/debugging.md](docs/debugging.md)。
 
 **安装**
 
