@@ -1,6 +1,6 @@
 // 把 lib/client.js 组装成 DSH 客户端模块入口。
 // client.js 自身已经是 window.__ModuleLoader__.load({...}) 的形式，
-// 引擎源码在此内联（浏览器端没有模块加载器），并补充来源说明。
+// 引擎源码在此内联，并补充来源说明。
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 
@@ -13,7 +13,7 @@ function buildClientBundle() {
   const engine = readFileSync(engineUrl, 'utf8')
   const source = readFileSync(sourceUrl, 'utf8')
   if (!source.includes(MARKER)) throw new Error(`client.js 缺少 ${MARKER} 标记`)
-  // 用函数形式替换，避免源码里的 $ 被当成替换模式。
+  // 用函数形式替换。
   const inlined = source.replace(MARKER, () => engine.trimEnd())
   return `// 本文件由 npm run build 生成，请修改 lib/client.js 后重新构建。\n${inlined}`
 }
