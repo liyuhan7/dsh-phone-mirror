@@ -1,6 +1,6 @@
 {
   "name": "dsh-phone-mirror",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "把安卓手机/平板投到 DSH 右侧栏，并用鼠标键盘反控：scrcpy 内核，浏览器端 WebCodecs 解码",
   "type": "module",
   "license": "MIT",
