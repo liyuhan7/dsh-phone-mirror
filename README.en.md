@@ -41,14 +41,15 @@ dsh plugin --profile <profile> add dsh-phone-mirror
 dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 ```
 
-**Fetch adb** (first run; `scrcpy-server.jar` ships with the repo)
+**adb**
+
+The first run downloads `platform-tools` (about 8 MB) into the plugin directory; run `npm run fetch:tools` inside `<profile dir>/node_modules/dsh-phone-mirror` to do it by hand:
 
 ```bash
-# run inside the plugin directory, i.e. <profile dir>/node_modules/dsh-phone-mirror
 npm run fetch:tools
 ```
 
-`platform-tools` is about 8 MB. If adb is already installed, point `adbPath` at it instead.
+If adb is already installed, point `adbPath` at it instead.
 
 **Run**
 

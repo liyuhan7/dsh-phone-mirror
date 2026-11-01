@@ -1,11 +1,12 @@
 // 下载 Android 工具链：platform-tools（adb）与 scrcpy-server。
 // 走 NODE_USE_ENV_PROXY 让 node 的 fetch 使用系统代理；工具链不进 git。
-import { mkdir, writeFile, stat, rename } from 'node:fs/promises'
+import { mkdir, stat, rename } from 'node:fs/promises'
 import { createWriteStream } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { ensurePlatformTools } from '../lib/adb.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const tools = join(here, '..', 'tools')
@@ -31,10 +32,8 @@ async function download(url, target) {
 
 await mkdir(tools, { recursive: true })
 
-await download(
-  'https://dl.google.com/android/repository/platform-tools-latest-windows.zip',
-  join(tools, 'platform-tools.zip')
-)
+// 与宿主运行时共用同一份下载与解压逻辑。
+console.log(`adb: ${await ensurePlatformTools()}`)
 
 await download(
   `https://github.com/Genymobile/scrcpy/releases/download/${SCRCPY_TAG}/scrcpy-server-${SCRCPY_TAG}`,

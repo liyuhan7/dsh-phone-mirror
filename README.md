@@ -39,14 +39,16 @@ dsh plugin --profile <profile> add dsh-phone-mirror
 dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 ```
 
-**准备 adb**（首次；`scrcpy-server.jar` 已随仓库提供）
+**adb**
+
+首次运行会自动下载 `platform-tools`（约 8 MB）到插件目录；也可以手动执行：
 
 ```bash
-# 在插件目录执行，全局安装后位于 <profile 目录>/node_modules/dsh-phone-mirror
+# 全局安装后位于 <profile 目录>/node_modules/dsh-phone-mirror
 npm run fetch:tools
 ```
 
-`platform-tools` 约 8 MB；系统里已有 adb 时可在配置里指定 `adbPath` 跳过。
+系统里已有 adb 时可在配置里指定 `adbPath` 跳过下载。
 
 **运行**
 

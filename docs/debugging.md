@@ -72,6 +72,7 @@ tools/platform-tools/adb.exe devices
 - 弹窗始终不出现：部分系统在锁屏或未解锁时不弹窗；先解锁再插线
 - Windows 设备管理器里有黄色感叹号：接口被厂商驱动占用，改成「Android ADB Interface」，或安装 Google USB Driver
 - 开机后失效：部分系统重启会重置授权，重新插线确认即可
+- 手动执行 adb 报 `cannot open ...\Temp\adb.log: Permission denied`：系统临时目录不可写；插件会给 adb 指定独立临时目录，面板内不受影响
 
 ## 参考
 
