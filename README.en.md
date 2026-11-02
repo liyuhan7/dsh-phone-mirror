@@ -2,7 +2,9 @@
 
 English | [中文](README.md)
 
-Mirror an Android phone or tablet into the DSH right sidebar and control it with your mouse and keyboard.
+While your agent works, your phone lives in the sidebar: watch a video, reply to messages, check notifications without leaving the desktop — no more picking the phone up and putting it down.
+
+Under the hood it is scrcpy 5.0.1 plus browser-side WebCodecs: the Android screen is mirrored into the DSH right sidebar and driven by your mouse and keyboard.
 
 ![Page example](docs/example.png)
 
