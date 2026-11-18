@@ -4,7 +4,9 @@
 
 用 agent 干活的时候，手机就在侧边栏：刷视频、回消息、看通知都不用离开电脑，省掉反复拿起放下的步骤。
 
-底层是 scrcpy 5.0.1 加浏览器端 WebCodecs：安卓设备的画面投到 DSH 右侧栏，鼠标键盘直接反控。
+底层支持两条独立路径：
+- **安卓**：scrcpy 5.0.1（H.264 + Opus）加浏览器端 WebCodecs，失败时自动降级 `adb screencap`。
+- **iOS（iOS 27+）**：CoreDevice `DisplayService`（HEVC `hvcC` + AAC-ELD 48kHz 立体声）加隧道 HID 反控，无需越狱、无需在手机端安装 App。
 
 ![页面示例](docs/example.png)
 
@@ -27,8 +29,8 @@
 - Windows（内置 adb 路径固定为 `tools/platform-tools/adb.exe`）
 - DSH `>= 0.2.0-rc.1 < 0.3.0`
 - Node.js 20+（仅首次下载工具与构建时使用）
-- 安卓设备已开启「开发者选项 → USB 调试」并完成授权
-- 转发声音需要 Android 11+
+- 安卓设备已开启「开发者选项 → USB 调试」并完成授权（转发声音需要 Android 11+）
+- iOS 设备需 **iOS 27+**、电脑已安装 Apple Devices（或 iTunes）驱动、手机开启「设置 → 隐私与安全性 → 开发者模式」并信任此电脑；本机需有 Python 3.11+（首次连接自动准备 `pymobiledevice3` 与 `av` 虚拟环境）
 
 各品牌开启 USB 调试的入口和额外开关见 [docs/debugging.md](docs/debugging.md)。
 

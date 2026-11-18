@@ -4,7 +4,9 @@ English | [中文](README.md)
 
 While your agent works, your phone lives in the sidebar: watch a video, reply to messages, check notifications without leaving the desktop — no more picking the phone up and putting it down.
 
-Under the hood it is scrcpy 5.0.1 plus browser-side WebCodecs: the Android screen is mirrored into the DSH right sidebar and driven by your mouse and keyboard.
+Under the hood it supports two decoupled paths:
+- **Android**: scrcpy 5.0.1 (H.264 + Opus) plus browser-side WebCodecs, with automatic `adb screencap` fallback.
+- **iOS (iOS 27+)**: CoreDevice `DisplayService` (HEVC `hvcC` + AAC-ELD 48 kHz stereo) plus tunnel HID remote control — no jailbreak and no app installed on the iPhone.
 
 ![Page example](docs/example.png)
 
@@ -29,8 +31,8 @@ Panel labels are Chinese only; the plugin does not ship translations yet.
 - Windows only — the bundled adb path is fixed at `tools/platform-tools/adb.exe`
 - DSH `>= 0.2.0-rc.1 < 0.3.0`
 - Node.js 20+ (only for the first tool download and for building)
-- Android device with Developer options → USB debugging enabled and authorized
-- Audio forwarding needs Android 11+
+- Android device with Developer options → USB debugging enabled and authorized (audio forwarding needs Android 11+)
+- iOS device running **iOS 27+**, Apple Devices (or iTunes) driver installed on Windows, Settings → Privacy & Security → Developer Mode enabled, and Python 3.11+ on the host (the plugin automatically sets up its `pymobiledevice3` + `av` virtualenv on first iOS connection)
 
 Per-brand USB debugging instructions: [docs/debugging.md](docs/debugging.md) (Chinese).
 

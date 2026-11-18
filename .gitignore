@@ -9,3 +9,7 @@ tools/*.zip
 # 系统
 .DS_Store
 Thumbs.db
+
+# Python 运行时缓存
+__pycache__/
+*.pyc

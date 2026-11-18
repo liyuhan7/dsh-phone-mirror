@@ -23,3 +23,8 @@
 
 `lib/protocol.js` 的字节布局与 `lib/session.js` 的 socket 协议实现参考 scrcpy 的公开协议文档与源码，
 属于对协议规范的独立实现，未复制其 C 源码。
+
+## iOS 桥接子进程（`bridge/`）
+
+- 依赖：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3)（GPL-3.0-or-later）与 [PyAV](https://github.com/PyAV-Org/PyAV)（BSD-3-Clause）
+- 许可：`bridge/ios_bridge.py` 作为独立子进程运行，遵循 GPL-3.0-or-later；本仓库不分发 Python 解释器、第三方 wheel 或 Apple Developer Disk Image，首次使用 iOS 投屏时在本地虚拟环境中安装。
