@@ -2,41 +2,40 @@
 
 English | [中文](README.md)
 
-While your agent works, your phone lives in the sidebar: watch a video, reply to messages, check notifications without leaving the desktop — no more picking the phone up and putting it down.
-
-Under the hood it supports two decoupled paths:
-- **Android**: scrcpy 5.0.1 (H.264 + Opus) plus browser-side WebCodecs, with automatic `adb screencap` fallback.
-- **iOS (iOS 27+)**: CoreDevice `DisplayService` (HEVC `hvcC` + AAC-ELD 48 kHz stereo) plus tunnel HID remote control — no jailbreak and no app installed on the iPhone.
-
-![Page example](docs/example.png)
-
 [![CI](https://github.com/liyuhan7/dsh-phone-mirror/actions/workflows/ci.yml/badge.svg)](https://github.com/liyuhan7/dsh-phone-mirror/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
+While your agent works, your phone lives in the sidebar: watch a video, reply to messages, check notifications without leaving the desktop. Video and audio stream live, and the mouse and keyboard drive the device.
+
+Two independent device paths:
+
+- **Android**: scrcpy 5.0.1 (H.264 + Opus) plus browser-side WebCodecs, with automatic `adb screencap` polling when scrcpy cannot start.
+- **iPhone / iPad (iOS 27+)**: CoreDevice `DisplayService` (HEVC `hvcC` + AAC-ELD 48 kHz stereo) plus tunnel HID remote control — no jailbreak and no app installed on the phone.
+
+![Page example](docs/example.png)
+
 ## Features
 
-- **A tab in the right sidebar**: add the "手机" tab from the sidebar's "+" and the device screen appears, scaled to fit; collapsing the sidebar or switching to another tab pauses audio/video delivery but keeps the device session, and returning resumes from a live keyframe; switching DSH conversations follows the phone tab when the sidebar is open and shares the same connection; another window covering DSH does not pause it; closing the last phone tab disconnects and releases the device-side session.
-- **Mouse and keyboard control**: clicks, drags and wheel scrolling are sent over the scrcpy control protocol; the keyboard is forwarded key by key like an external one — on iOS the pinyin is composed by the phone's own input method and picked from the PC keyboard with digits, space or enter while the on-screen keyboard stays hidden, and ASCII types straight through; on Android non-ASCII text is injected as key events.
-- **Audio forwarding**: Opus 48 kHz stereo through an AudioWorklet ring buffer, 80 ms startup buffer that grows to 240 ms on underrun; devices without capturable audio fall back to a silent session.
-- **Decoding on a worker thread**: the stream, H.264 decoding, drawing and audio decoding all run in a Worker, so DSH spending the main thread on chat rendering or file writes does not stall the panel; without a Worker it falls back to the main thread.
-- **Automatic fallback**: when scrcpy cannot start, the plugin polls `adb screencap` instead (260 ms per frame by default), which is slow but works on almost any device adb can reach.
-- **From cable to Wi-Fi**: on Android the panel's "转无线" switches USB debugging to TCP and connects automatically; on iOS it pairs over USB, then you unplug and press Connect (the address was already learned, so it connects instantly)
+- **A tab in the right sidebar**: add the "手机" tab from the sidebar's "+" and the screen appears, scaled to fit; collapsing the sidebar or switching to another tab pauses audio/video delivery but keeps the device session, and returning resumes from a live keyframe; switching DSH conversations follows the phone tab when the sidebar is open and shares the same connection; closing the last phone tab disconnects and releases the device-side session.
+- **Mouse and keyboard control**: clicks, drags and wheel scrolling go over the device protocol; the keyboard is forwarded key by key like an external one — on iOS the pinyin is composed by the phone's own input method and picked with digits, space or enter, while on Android Chinese text is injected through the clipboard.
+- **Audio forwarding**: Opus 48 kHz stereo on Android and AAC-ELD 48 kHz stereo on iOS, played through an AudioWorklet ring buffer; devices or hosts without the codec fall back to a silent session.
+- **Decoding on a worker thread**: the stream, video decoding, drawing and audio decoding all run in a Worker, so DSH spending the main thread on chat rendering or file writes does not stall the panel; without a Worker it falls back to the main thread.
+- **Android fallback**: when scrcpy cannot start, the plugin polls `adb screencap` instead, which is slow but works on almost any device adb can reach.
+- **From cable to Wi-Fi**: the panel's "转无线" moves the connection onto the LAN; Android switches USB debugging to TCP and connects automatically, iOS pairs for wireless and remembers the phone's address so you only unplug and press Connect.
 
-Panel labels are Chinese only; the plugin does not ship translations yet.
+## Requirements
 
-## Quick start
-
-**Requirements**
-
-- Windows only — the bundled adb path is fixed at `tools/platform-tools/adb.exe`
-- DSH `>= 0.2.0-rc.1 < 0.3.0`
-- Node.js 20+ (only for the first tool download and for building)
-- Android device with Developer options → USB debugging enabled and authorized (audio forwarding needs Android 11+)
-- iOS device running **iOS 27+**, Apple Devices (or iTunes) driver installed on Windows, Settings → Privacy & Security → Developer Mode enabled, and Python 3.11+ on the host (the plugin automatically sets up its `pymobiledevice3` + `av` virtualenv on first iOS connection)
+| Item | Notes |
+| --- | --- |
+| DSH | `>= 0.2.0-rc.1 < 0.3.0` |
+| Node.js | 20+, only for the first tool download and for building |
+| Host OS | Windows is the primary tested platform; macOS / Linux download their own platform-tools, and iOS also needs a working usbmuxd |
+| Android device | Developer options → USB debugging enabled and authorized; audio forwarding needs Android 11+ |
+| iPhone / iPad | **iOS 27+**, Apple Devices or iTunes installed on Windows, Developer Mode enabled; the iOS runtime ships with the plugin, so no Python install is needed |
 
 Per-brand USB debugging instructions: [docs/debugging.md](docs/debugging.md) (Chinese).
 
-**Install**
+## Install
 
 ```bash
 # npm package, prebuilt install
@@ -45,40 +44,59 @@ dsh plugin --profile <profile> add dsh-phone-mirror
 dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 ```
 
-**adb**
+Dependencies are prepared on first use:
 
-The first run downloads `platform-tools` (about 8 MB) into the plugin directory; run `npm run fetch:tools` inside `<profile dir>/node_modules/dsh-phone-mirror` to do it by hand:
+- **Android**: `platform-tools` (about 8 MB) is downloaded into the plugin directory; run `npm run fetch:tools` to do it by hand, or point `adbPath` at an existing adb.
+- **iOS**: the Windows x64 iOS runtime (portable Python plus `pymobiledevice3` and `PyAV`, about 100 MB compressed) is installed through an npm optional dependency. When that package is missing or skipped, the first connection downloads it from the Release into `~/.dsh/phone-mirror-ios-runtime/`; only when both fail does the plugin fall back to a local Python 3.11+ install.
 
-```bash
-npm run fetch:tools
-```
+## Connecting a device
 
-If adb is already installed, point `adbPath` at it instead.
+### Android
 
-**Run**
+1. Enable USB debugging under Developer options, plug in the cable, and accept "Allow USB debugging" with "Always allow" checked
+2. Restart DSH and add the "手机" tab from the right sidebar's "+"
+3. Pick "安卓" as the platform, select the device and press "连接"
+4. To drop the cable, press "转无线": the plugin reads the device's WLAN address, runs `adb tcpip 5555` and connects automatically
 
-1. Restart DSH and add the "手机" tab from the right sidebar's "+"
-2. Pick your device at the top and click "连接"
-3. Accept "Allow USB debugging" on the device, with "Always allow" checked
-4. To drop the cable, press "转无线" at the bottom of the panel and unplug once it reports the wireless address
+On native Android 11+ you can also use "配对" with the pairing address and 6-digit code shown on the wireless debugging page; the plugin then finds the connect port over mDNS.
 
-**Expected result**: the panel shows the device screen and the caption reads `BKY-W10 · 1048×1600 · 30fps` (device · resolution · live fps).
+### iPhone / iPad
 
-## Usage
+1. Turn on "设置 → 隐私与安全性 → 开发者模式", then reboot and confirm
+2. Connect the cable, unlock the phone, and trust the computer with the passcode
+3. Add the "手机" tab, switch the platform to "iOS", select `iPhone` and press "连接"; the first connection prepares the Python dependencies and mounts the Developer Disk Image, so keep the phone unlocked
+4. For wireless: keep the USB cable connected, press "转无线", unplug once pairing completes, then select `iPhone (Wi-Fi)` and press "连接"
 
-```text
-click / drag / wheel    operate the device directly
-keyboard                iOS: click the screen to take over, then just type — pinyin composes on the phone, digits/space/enter pick candidates; changing the phone's orientation hands the on-screen keyboard back
-                        Android: click the screen to capture it; Esc releases focus
-fullscreen              the "全屏" toolbar button
-quality                 smooth 720 / standard 1080 / high 1600
-wireless                "转无线" switches USB to TCP and connects automatically
-pairing                 "配对" takes the pairing address and 6-digit code
-"断开连接"              stops wireless mirroring or cancels reconnect without affecting USB
-                         hides the iOS Wi-Fi entry until DSH restarts or "转无线" is used again; keeps pairing
-```
+Prerequisites, keyboard input, toolbar actions and troubleshooting are documented in [docs/ios.md](docs/ios.md) (Chinese).
 
-If the picture is corrupted or black, press "重建画面": the decoder is dropped and the stream re-attached so the device sends a fresh keyframe.
+**Expected result**: the panel shows the device screen and the caption reads `device · resolution · live fps`, for example `BKY-W10 · 1048×1600 · 30fps`.
+
+## Using the panel
+
+### Picture and touch
+
+Click, long-press and drag operate the device, and the wheel scrolls it. If the picture is corrupted or black, press "重建画面": the decoder is dropped and the stream re-attached so the device sends a fresh keyframe. "全屏" fills the window; press "退出全屏" to leave it.
+
+### Keyboard and input method
+
+- **Android**: click the picture to capture the keyboard; Esc releases focus. A composed input-method result is pasted into the device's focused field through the clipboard, while ASCII characters are injected key by key.
+- **iOS**: click the picture to capture the keyboard, then just type. Set the computer input method to English and type pinyin — the phone's own input method composes it, the candidate bar stays on the phone, and digits, space or enter pick a candidate. Esc is forwarded to the phone, Ctrl+Space switches the phone's language, and rotating the phone hands the on-screen keyboard back.
+
+### Toolbar
+
+- Android: 返回, Home, 任务, 音量-, 音量+, 电源, 旋转, 通知, 全屏
+- iOS: Home, 任务, 音量-, 音量+, 电源, 旋转, 通知, 控制, 全屏
+
+Button semantics and the iOS pull-down gestures are described in [docs/ios.md](docs/ios.md).
+
+### Audio and quality
+
+The speaker button controls whether the sidebar plays device audio; it is disabled when the device or the host cannot provide audio. The quality presets (流畅 720 / 标准 1080 / 高清 1600) apply to Android only — iOS streams at the device's native resolution — and changing a preset reconnects the session.
+
+### Wireless
+
+- **Android**: "转无线" switches USB debugging to TCP and connects; "配对" handles wireless debugging; "断开连接" drops only the wireless link and leaves USB and any live session alone.
+- **iOS**: "转无线" pairs over USB and remembers the phone's address; after unplugging, connect to `iPhone (Wi-Fi)`, and a dropped link reopens automatically within 90 seconds. "断开连接" stops the wireless mirroring and removes the entry from the list while keeping the pairing.
 
 ## Configuration
 
@@ -95,14 +113,14 @@ Override in the profile's `cordis.patch.yml`:
 | Field | Default | Description |
 | --- | --- | --- |
 | `mode` | `auto` | `auto` tries scrcpy first (retrying without audio), then falls back to screencap |
-| `maxSize` | `1280` | Long-edge pixel cap, overridden by the panel's quality preset |
+| `maxSize` | `1280` | Long-edge pixel cap, overridden by the panel preset; Android only |
 | `maxFps` | `60` | Encoder frame rate cap |
 | `videoBitRate` | `8000000` | Encoder bit rate in bps |
 | `screencapIntervalMs` | `260` | Frame interval in the screencap fallback |
 | `audio` | `true` | Forward device audio; unsupported devices start silent next time |
 | `adbPath` | empty | Custom adb path, the bundled one when empty |
 | `serverJar` | empty | Custom `scrcpy-server.jar` path |
-| `iosWirelessHost` | empty | Manual fallback for the iPhone's wireless address; normally learned automatically while USB-connected |
+| `iosWirelessHost` | empty | Manual fallback for the iPhone's wireless address (e.g. `10.4.53.159`); normally learned and verified over USB |
 
 ## FAQ
 
@@ -116,15 +134,21 @@ The desktop profile is owned by the Electron app. Edit that profile's `package.j
 
 **No sound**
 
-Check the speaker button first: grey means this session never got audio — see `session.audio` and `session.audioCodec` at `/dsh-phone-mirror/api/status`. If the button is enabled but you hear nothing, check the computer volume, the device volume, and whether the app that is playing forbids capture.
+Check the speaker button first. On Android, grey means the session never got audio — see `session.audio` and `session.audioCodec` at `/dsh-phone-mirror/api/status`; on iOS it means the host lacks an AAC-ELD decoder. If the button is enabled but you hear nothing, check the computer volume, the device volume, and whether the playing app forbids capture.
 
 **iPhone wireless connect fails with "no RemotePairing broadcast"**
 
-Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address automatically while it is connected over USB (packet capture on the device, verified over TCP) and dials that address directly — no mDNS involved. When the phone's IP changes, connect over USB once to refresh; as a last resort set `iosWirelessHost` manually.
+Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address while it is connected over USB (packet capture, verified over TCP) and dials that address directly. When the phone's IP changes, connect over USB once to refresh; as a last resort set `iosWirelessHost` manually. See [docs/ios.md](docs/ios.md) for more.
 
 **Black picture, or a single-digit frame rate**
 
-DRM content (paid video apps) goes through `MediaCodec`'s secure path and can only render black; when the device screen is static, scrcpy produces no frames, so a single-digit rate is expected.
+On Android, DRM content (paid video apps) goes through `MediaCodec`'s secure path and can only render black; when the device screen is static, scrcpy produces no frames, so a single-digit rate is expected.
+
+## Documentation
+
+- [docs/ios.md](docs/ios.md): connecting and using an iPhone / iPad, toolbar, troubleshooting (Chinese)
+- [docs/debugging.md](docs/debugging.md): enabling USB debugging on Android brands (Chinese)
+- [THIRD-PARTY.md](THIRD-PARTY.md): third-party components and licenses (Chinese)
 
 ## License
 

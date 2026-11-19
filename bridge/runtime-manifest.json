@@ -1,0 +1,11 @@
+{
+  "runtimeVersion": 1,
+  "python": "3.11.9",
+  "platforms": {
+    "win32-x64": {
+      "file": "dsh-phone-mirror-ios-runtime-win32-x64.zip",
+      "url": "https://github.com/liyuhan7/dsh-phone-mirror/releases/download/ios-runtime-v1/dsh-phone-mirror-ios-runtime-win32-x64.zip",
+      "sha256": "ea038c2322f03fb661a6d7588d5aed3783280f06510f909e8a3d98825fd80944"
+    }
+  }
+}

@@ -72,6 +72,7 @@ test('bottom disconnect hides the selected iPhone from both wireless discovery s
   const createProvider = runInNewContext(`${providerSource.replaceAll('import.meta.url', 'entry')}\ncreateIosProvider`, {
     entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
     existsSync: () => true, readdirSync: () => records,
+    runtimeState: { preparing: false, message: '' },
     pairIosWireless: async (id) => ({ ok: pairSucceeded, address: `wifi:${id}` }),
     // 在线/离线探测用：测试里没有学到的地址，直接当离线，不去连真实端口。
     learnedWirelessHost: () => '',

@@ -24,3 +24,5 @@ jobs:
           node-version: ${{ matrix.node }}
       - name: 语法检查并校验客户端 bundle
         run: npm run check
+      - name: 单元测试
+        run: npm test

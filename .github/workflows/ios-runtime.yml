@@ -1,0 +1,44 @@
+name: iOS runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 运行时 npm 版本（同时决定 ios-runtime-vN 标签）
+        required: true
+        default: 1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build ios runtime (win32-x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 构建运行时并更新清单
+        run: npm run build:ios-runtime -- --python python --version ${{ inputs.version }} --force
+      - name: 上传运行时压缩包
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-phone-mirror-ios-runtime-win32-x64
+          path: dist/ios-runtime/dsh-phone-mirror-ios-runtime-win32-x64.zip
+      - name: 上传 npm 平台包目录
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-phone-mirror-ios-runtime-win32-x64-package
+          path: dist/ios-runtime/dsh-phone-mirror-ios-runtime-win32-x64
+      - name: 上传运行时清单
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-manifest
+          path: bridge/runtime-manifest.json
+      - name: 记录清单
+        run: Get-Content bridge/runtime-manifest.json

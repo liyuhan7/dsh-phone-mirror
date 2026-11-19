@@ -27,4 +27,10 @@
 ## iOS 桥接子进程（`bridge/`）
 
 - 依赖：[pymobiledevice3](https://github.com/doronz88/pymobiledevice3)（GPL-3.0-or-later）与 [PyAV](https://github.com/PyAV-Org/PyAV)（BSD-3-Clause）
-- 许可：`bridge/ios_bridge.py` 作为独立子进程运行，遵循 GPL-3.0-or-later；本仓库不分发 Python 解释器、第三方 wheel 或 Apple Developer Disk Image，首次使用 iOS 投屏时在本地虚拟环境中安装。
+- 许可：`bridge/ios_bridge.py` 作为独立子进程运行，遵循 GPL-3.0-or-later；Apple Developer Disk Image 不随仓库分发，由设备侧服务在首次连接时挂载。
+
+## iOS 运行时（npm 平台包与 Release 压缩包）
+
+- 内容：Python 3.11 嵌入式发行版（PSF-2.0）、`pymobiledevice3`（GPL-3.0-or-later）、PyAV（BSD-3-Clause），以及 PyAV wheel 附带的 FFmpeg 动态库（LGPL-2.1-or-later，未修改）
+- 该运行时不进 git 仓库，用 `npm run build:ios-runtime` 生成后作为独立 npm 包与 Release 资源分发，在其自身目录内附许可说明
+- 下架或替换运行时不影响插件主体：配置 `DSH_PHONE_MIRROR_IOS_PYTHON` 指向自备环境即可

@@ -36,12 +36,10 @@ from typing import Any, Optional
 
 def _ensure_writable_home() -> Path:
     """Ensure pymobiledevice3's home folder (~/.pymobiledevice3) is writable;
-    fall back to a workspace-local home if the OS user profile is restricted."""
+    fall back to a plugin-local home if the OS user profile is restricted."""
     here = Path(__file__).resolve().parent
     candidates = [
-        Path("D:/dsh-common/dsh-phone-mirror/.tmp/home"),
         here.parent / ".tmp" / "home",
-        here.parent.parent / ".tmp" / "home",
         Path.home(),
     ]
     chosen: Optional[Path] = None
@@ -706,8 +704,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             logging.debug("keyboard link warm-up failed", exc_info=True)
 
     async def _send_scroll(self, scroll: dict[str, Any]) -> None:
-        # 客户端 dy 为「向上为正」（scrcpy 习惯），实测设备方向相反，
-        # 所以对 x/y 取反；一格滚轮（客户端 1 单位）放大约 36 个设备增量。
+        # 客户端 dy 为「向上为正」（scrcpy 习惯），设备 HID 增量方向与之相反，
+        # 因此取反；一格滚轮（客户端 1 单位）放大约 36 个设备增量。
         scale = 36
         dx = -max(-127, min(127, round(float(scroll.get("dx", 0)) * scale)))
         dy = -max(-127, min(127, round(float(scroll.get("dy", 0)) * scale)))
@@ -719,8 +717,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         )
         await self._ensure_hid()
         service = DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE
-        # 与抓包一致的持续手势：首个增量走 mayBegin+began，后续增量走 changed，
-        # 停止 120ms 后发 ended；不发 momentum，滚轮停下即停住。
+        # 持续手势：首个增量走 mayBegin+began，后续增量走 changed，停止 120ms 后发 ended；
+        # 不发 momentum，滚轮停下即停住。
         phase = 0x02 if self._scroll_active else 0x01
         reports = [pointer] if self._scroll_active else [
             pointer,
@@ -868,9 +866,8 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "") -> int
             bind="127.0.0.1",
             http_port=port,
             audio_default_on=True,
-            # pmd 的 motion-IDR 每秒多发一个关键帧；在持续运动（看视频）时这批关键帧
-            # 压力会把设备编码器压停，表现为画面突然冻住。关掉它换取稳定，
-            # 分辨率收缩的恢复交给前端的补偿逻辑。
+            # 关闭 pmd 的 motion-IDR 周期关键帧：屏幕持续运动时这些关键帧会把设备编码器压停，
+            # 画面随即冻结。分辨率收缩由前端的补偿逻辑恢复。
             motion_idr=False,
         )
 

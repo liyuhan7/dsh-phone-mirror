@@ -3,8 +3,10 @@ node_modules/
 
 # 运行时下载/生成物
 tools/platform-tools/
+tools/ios-runtime/
 tools/*.zip
 .tmp/
+dist/
 
 # 系统
 .DS_Store

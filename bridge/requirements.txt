@@ -1,2 +1,2 @@
 pymobiledevice3==11.58.0
-av>=14.0.0
+av==18.1.0
