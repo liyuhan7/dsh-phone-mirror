@@ -6,7 +6,7 @@ import { frame, KIND, VIDEO_FLAGS, videoPayload } from '../lib/core/frames.js'
 
 const source = readFileSync(new URL('../lib/engine.js', import.meta.url), 'utf8')
 
-test('iOS presents only the latest decoded frame at vsync using a stable intermediate canvas', async () => {
+test('iOS presents decoded frames in order and bounds the queue', async () => {
   const callbacks = new Map()
   const decoded = []
   const blits = []
@@ -52,6 +52,7 @@ test('iOS presents only the latest decoded frame at vsync using a stable interme
     callbacks.delete(id)
     callback()
   }
+  const lastBlit = () => blits[blits.length - 1]
   engine.handle({ type: 'open', streamUrl: '/video' })
   try {
     send(frame(KIND.META, Buffer.from(JSON.stringify({
@@ -59,14 +60,26 @@ test('iOS presents only the latest decoded frame at vsync using a stable interme
       videoCodec: 'hvc1.test', videoDescription: 'AA=='
     }))), video(1, VIDEO_FLAGS.KEY), video(2), video(3))
     await settle()
-    assert.deepEqual(decoded.map((f) => f.closed), [1, 1, 0])
+    // 三帧都留在队列里，没有被丢。
+    assert.deepEqual(decoded.map((f) => f.closed), [0, 0, 0])
     paint()
-    send(video(4))
+    assert.deepEqual(lastBlit(), [1, 1080, 1920])
+    assert.equal(decoded[0].closed, 1)
+    paint()
+    assert.deepEqual(lastBlit(), [2, 1080, 1920])
+    paint()
+    assert.deepEqual(lastBlit(), [3, 1080, 1920])
+    assert.equal(callbacks.size, 0)
+    // 连发六帧：队列上限 4，最旧的两帧被丢。
+    send(video(4), video(5), video(6), video(7), video(8), video(9))
     await settle()
-    paint()
-    assert.deepEqual(blits, [[3, 1080, 1920], [4, 1080, 1920]])
-    assert.equal(scratchCanvases.length, 1)
-    send(video(5))
+    assert.deepEqual(decoded.slice(3).map((f) => f.closed), [1, 1, 0, 0, 0, 0])
+    for (const id of [6, 7, 8, 9]) {
+      paint()
+      assert.deepEqual(lastBlit(), [id, 1080, 1920])
+    }
+    assert.equal(callbacks.size, 0)
+    send(video(10))
     await settle()
     assert.equal(callbacks.size, 1)
   } finally {
@@ -74,5 +87,6 @@ test('iOS presents only the latest decoded frame at vsync using a stable interme
     controller.close()
   }
   assert.equal(callbacks.size, 0)
-  assert.deepEqual(decoded.map((f) => f.closed), [1, 1, 1, 1, 1])
+  assert.ok(decoded.every((f) => f.closed === 1))
+  assert.equal(scratchCanvases.length, 1)
 })

@@ -65,7 +65,7 @@ On native Android 11+ you can also use "配对" with the pairing address and 6-d
 1. Turn on "设置 → 隐私与安全性 → 开发者模式", then reboot and confirm
 2. Connect the cable, unlock the phone, and trust the computer with the passcode
 3. Add the "手机" tab, switch the platform to "iOS", select `iPhone` and press "连接"; the first connection prepares the Python dependencies and mounts the Developer Disk Image, so keep the phone unlocked
-4. For wireless: keep the USB cable connected, press "转无线", unplug once pairing completes, then select `iPhone (Wi-Fi)` and press "连接"
+4. For wireless: keep the USB cable connected and press "转无线". Wait for the wireless address to be verified before unplugging, then select `iPhone (Wi-Fi)` and press "连接". For a paired device, use "手填地址" to connect using the phone’s current IPv4 address.
 
 Prerequisites, keyboard input, toolbar actions and troubleshooting are documented in [docs/ios.md](docs/ios.md) (Chinese).
 
@@ -120,7 +120,7 @@ Override in the profile's `cordis.patch.yml`:
 | `audio` | `true` | Forward device audio; unsupported devices start silent next time |
 | `adbPath` | empty | Custom adb path, the bundled one when empty |
 | `serverJar` | empty | Custom `scrcpy-server.jar` path |
-| `iosWirelessHost` | empty | Manual fallback for the iPhone's wireless address (e.g. `10.4.53.159`); normally learned and verified over USB |
+| `iosWirelessHost` | empty | Manual iPhone wireless address (e.g. `10.4.53.159`), which overrides the address learned over USB. Leave empty to use the learned address. |
 
 ## FAQ
 
@@ -138,7 +138,7 @@ Check the speaker button first. On Android, grey means the session never got aud
 
 **iPhone wireless connect fails with "no RemotePairing broadcast"**
 
-Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address while it is connected over USB (packet capture, verified over TCP) and dials that address directly. When the phone's IP changes, connect over USB once to refresh; as a last resort set `iosWirelessHost` manually. See [docs/ios.md](docs/ios.md) for more.
+Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address while it is connected over USB (packet capture, verified over TCP) and dials that address directly. When the phone’s IP changes, set `iosWirelessHost` to override the old address, or leave it empty and connect over USB once to refresh the learned address. See [docs/ios.md](docs/ios.md) for more.
 
 **Black picture, or a single-digit frame rate**
 
