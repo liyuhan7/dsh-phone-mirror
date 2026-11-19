@@ -9,7 +9,7 @@ import { runInNewContext } from 'node:vm'
 import * as http from '../lib/core/http.js'
 
 const entry = new URL('../lib/index.js', import.meta.url)
-const source = readFileSync(entry, 'utf8').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+const source = readFileSync(entry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
 const serial = 'wifi:active-phone'
 
 function fixture() {
@@ -22,7 +22,7 @@ function fixture() {
     status: async () => ({ devices: [{ serial: 'wifi:other-phone' }, { serial }] }),
     canRecoverWireless: async () => await nextProbe ?? true,
     disconnectWireless: async (address) => ({ address, status: 200, body: { ok: true } }),
-    async startSession({ wire, serial: targetSerial }) {
+    async startSession({ wire, serial: targetSerial, tabId }) {
       const target = Object.assign(new EventEmitter(), {
         platform: 'ios', serial: targetSerial, stopped: false,
         async stop() { this.stopped = true; this.emit('close') }
@@ -31,7 +31,7 @@ function fixture() {
       wire(target, 'coredevice')
       await nextStart
       target.emit('ready', {})
-      return { session: target, info: { platform: 'ios', serial: targetSerial, state: 'running' } }
+      return { session: target, info: { platform: 'ios', serial: targetSerial, state: 'running', tabId } }
     }
   }
   const schema = new Proxy(() => schema, { get: () => schema })
@@ -62,7 +62,7 @@ const flush = () => new Promise(setImmediate)
 
 test('bottom disconnect hides the selected iPhone from both wireless discovery sources', async () => {
   const providerEntry = new URL('../lib/providers/ios/index.js', import.meta.url)
-  const providerSource = readFileSync(providerEntry, 'utf8').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+  const providerSource = readFileSync(providerEntry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
   const udid = 'active-phone'
   const records = [`${udid}.plist`, `remote_${udid}.plist`, 'remote_other-phone.plist']
   let pairSucceeded = false
@@ -113,6 +113,17 @@ test('disconnect stops the named wireless session but preserves pairing and USB'
   state = await call('/status')
   assert.equal(state.session.serial, 'usb-phone')
   assert.equal(targets[1].stopped, false)
+})
+
+test('closing a tab only stops the session that tab owns', async () => {
+  const { call, targets } = fixture()
+  await call('/connect', { platform: 'ios', serial, tabId: 'tab-a' })
+  assert.equal((await call('/status')).session.tabId, 'tab-a')
+  await call('/disconnect', { tabId: 'tab-b' })
+  assert.equal(targets[0].stopped, false)
+  await call('/disconnect', { tabId: 'tab-a' })
+  assert.equal(targets[0].stopped, true)
+  assert.equal((await call('/status')).session.state, 'idle')
 })
 
 for (const when of ['probe', 'startup']) {
