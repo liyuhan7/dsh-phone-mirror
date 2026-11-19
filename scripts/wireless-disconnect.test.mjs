@@ -39,6 +39,9 @@ function fixture() {
     ...http, entry, URL, readFileSync, z: schema,
     createAndroidProvider: () => ({ status: async () => ({ devices: [] }) }),
     createIosProvider: () => provider,
+    // 拔线监听用：测试里没有真实 usbmux，当作「USB 一直在」。
+    queryUsbmuxDevices: async () => ({ ok: true, devices: [] }),
+    clearInterval() {},
     setInterval(callback, delay) { if (delay === 4000) tick = callback; return 1 }
   })
   apply({ effect: (callback) => callback(), webServer: {
@@ -70,6 +73,8 @@ test('bottom disconnect hides the selected iPhone from both wireless discovery s
     entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
     existsSync: () => true, readdirSync: () => records,
     pairIosWireless: async (id) => ({ ok: pairSucceeded, address: `wifi:${id}` }),
+    // 在线/离线探测用：测试里没有学到的地址，直接当离线，不去连真实端口。
+    learnedWirelessHost: () => '',
     netConnect() {
       const socket = new EventEmitter()
       socket.setTimeout = socket.destroy = () => {}

@@ -499,6 +499,26 @@ def _dominant_wireless_candidates(src_counts: dict[str, int], exclude: set[str])
     return [ip for ip, _ in sorted(src_counts.items(), key=lambda item: -item[1]) if usable(ip)]
 
 
+async def _screen_is_active(rsd) -> bool:
+    """主屏背光是否亮着。判断不出来时按「亮着」处理——宁可多重建一次也别永久卡死。"""
+    try:
+        from pymobiledevice3.remote.core_device.device_info import DeviceInfoService
+        service = DeviceInfoService(rsd)
+        await service.connect()
+        try:
+            info = await service.get_display_info()
+        finally:
+            with contextlib.suppress(Exception):
+                await service.close()
+        for display in (info.get("current") or {}).get("displays", []):
+            if display.get("external"):
+                continue
+            return str(display.get("backlightState", "")).lower() not in ("off", "sleep")
+    except Exception:
+        return True
+    return True
+
+
 def _endpoint_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -916,13 +936,27 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "") -> int
         async def watch_stream_stall() -> str:
             loop = asyncio.get_running_loop()
             limit = getattr(pmd_screen_stream, "_MAX_STALL_RESTARTS", 3)
+            next_screen_check = 0.0
             while True:
                 await asyncio.sleep(3)
                 if server._active_service is None:
                     continue
                 idle = loop.time() - getattr(server, "_last_good_au_t", loop.time())
-                if idle > 12 and getattr(server, "_consecutive_restarts", 0) >= limit:
-                    return f"画面流停滞 {idle:.0f} 秒且自动重启无效，正在重连"
+                if idle < 12 or getattr(server, "_consecutive_restarts", 0) < limit:
+                    continue
+                if loop.time() < next_screen_check:
+                    continue
+                next_screen_check = loop.time() + 30
+                screen_active = await _screen_is_active(server._rsd)
+                if not screen_active:
+                    continue
+                # 判别：让编码器回一个 IDR。活着的编码器即使画面静止也会应答。
+                with contextlib.suppress(Exception):
+                    server._request_recovery_idr(reason="stall-watchdog")
+                await asyncio.sleep(5)
+                if loop.time() - getattr(server, "_last_good_au_t", 0.0) < 8:
+                    continue
+                return f"画面流停滞 {idle:.0f} 秒且自动重启无效，正在重连"
 
         stall_task = asyncio.create_task(watch_stream_stall())
         try:
