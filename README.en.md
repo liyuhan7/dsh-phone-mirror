@@ -73,7 +73,8 @@ fullscreen              the "全屏" toolbar button
 quality                 smooth 720 / standard 1080 / high 1600
 wireless                "转无线" switches USB to TCP and connects automatically
 pairing                 "配对" takes the pairing address and 6-digit code
-"断开连接"              drops the wireless channel only; USB is untouched
+"断开连接"              stops wireless mirroring or cancels reconnect without affecting USB
+                         hides the iOS Wi-Fi entry until DSH restarts or "转无线" is used again; keeps pairing
 ```
 
 If the picture is corrupted or black, press "重建画面": the decoder is dropped and the stream re-attached so the device sends a fresh keyframe.

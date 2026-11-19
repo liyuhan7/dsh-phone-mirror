@@ -17,13 +17,18 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import ipaddress
 import json
 import logging
 import os
 import plistlib
 import shutil
+import socket
+import struct
 import sys
 import tempfile
+import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
@@ -87,9 +92,12 @@ import pymobiledevice3.common as pmd_common  # noqa: E402
 import pymobiledevice3.lockdown as pmd_lockdown  # noqa: E402
 import pymobiledevice3.pair_records as pmd_pair_records  # noqa: E402
 import pymobiledevice3.remote.core_device.screen_stream as pmd_screen_stream  # noqa: E402
+from pymobiledevice3.bonjour import browse_remotepairing  # noqa: E402
 from pymobiledevice3.exceptions import (  # noqa: E402
+    ConnectionTerminatedError,
     DeviceNotFoundError,
     InvalidServiceError,
+    MuxException,
     NotPairedError,
     PasswordRequiredError,
     RemotePairingCompletedError,
@@ -99,9 +107,12 @@ from pymobiledevice3.lockdown import create_using_usbmux  # noqa: E402
 from pymobiledevice3.remote import tunnel_service, userspace_tunnel  # noqa: E402
 from pymobiledevice3.remote.core_device.display_service import DisplayService  # noqa: E402
 from pymobiledevice3.remote.core_device.hid_service import (  # noqa: E402
+    DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE,
     HID_BUTTON_STATE_DOWN,
     HID_BUTTON_STATE_UP,
+    build_digitizer_report,
 )
+from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService  # noqa: E402
 from pymobiledevice3.remote.core_device.screen_stream import (  # noqa: E402
     ScreenStreamServer,
     hevc_decoder_configuration_record,
@@ -112,6 +123,20 @@ from pymobiledevice3.services.amfi import AmfiService  # noqa: E402
 from pymobiledevice3.services.mobile_image_mounter import auto_mount  # noqa: E402
 
 pmd_common._HOMEFOLDER = _PMD_HOME
+
+
+async def _watch_stdin(stop: asyncio.Event) -> None:
+    """Node 父进程写入 quit（或关闭 stdin）时请求退出，让 serve() 走正常清理。"""
+    loop = asyncio.get_running_loop()
+    while True:
+        try:
+            line = await loop.run_in_executor(None, sys.stdin.readline)
+        except Exception:
+            stop.set()
+            return
+        if not line or line.strip().lower() in {"quit", "exit"}:
+            stop.set()
+            return
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -205,6 +230,106 @@ def _aac_eld_supported() -> bool:
         return False
 
 
+async def _ensure_usb_pairing(lockdown) -> None:
+    if lockdown.paired:
+        return
+    previous = lockdown.pair_record
+    try:
+        await lockdown.pair()
+    except MuxException as exc:
+        # PMD 先写本地记录，再交给 usbmuxd；AMDS 拒绝自己的副本时仍须向设备验证。
+        if (sys.platform != "win32" or "SavePairRecord request:" not in str(exc)
+                or "'Number': 183}" not in str(exc)
+                or not lockdown.pair_record or lockdown.pair_record is previous):
+            raise
+    if not await lockdown.validate_pairing():
+        raise NotPairedError("iPhone 未接受此电脑的 USB 信任记录")
+
+
+def _remote_addresses(answer):
+    if sys.platform != "win32":
+        return [address.full_ip for address in answer.addresses]
+
+    ipv4 = [address.ip for address in answer.addresses if ":" not in address.ip]
+    ipv6 = []
+    lan_scopes = _lan_ipv6_scopes(ipv4)
+    for address in answer.addresses:
+        if ":" not in address.ip:
+            continue
+        if not ipaddress.ip_address(address.ip).is_link_local:
+            ipv6.append(address.ip)
+            continue
+        # PMD may guess a VPN adapter for fe80::/64. Prefer the LAN inferred from the phone's A record.
+        scopes = lan_scopes
+        if not scopes and address.iface:
+            with contextlib.suppress(OSError):
+                scopes = [socket.if_nametoindex(address.iface)]
+        ipv6.extend(f"{address.ip}%{scope}" for scope in scopes)
+    return ipv4 + ipv6
+
+
+def _lan_ipv6_scopes(ipv4):
+    import ifaddr
+
+    matches = []
+    for adapter in ifaddr.get_adapters():
+        scopes = {addr.ip[2] for addr in adapter.ips if addr.is_IPv6 and addr.ip[2]}
+        for addr in adapter.ips:
+            if addr.is_IPv4 and any(ipaddress.ip_address(ip) in ipaddress.ip_network(
+                f"{addr.ip}/{addr.network_prefix}", strict=False
+            ) for ip in ipv4):
+                matches.extend((addr.network_prefix, scope) for scope in sorted(scopes))
+    return list(dict.fromkeys(scope for _, scope in sorted(matches, reverse=True)))
+
+
+async def _open_remote_tunnel(udid: str):
+    record = pmd_pair_records.get_local_pairing_record(
+        pmd_pair_records.get_remote_pairing_record_filename(udid), _PMD_HOME
+    )
+    irk = (record or {}).get(tunnel_service.PEER_ALT_IRK_KEY)
+    if not isinstance(irk, bytes) or len(irk) != 16:
+        raise UserspaceTunnelUnavailableError("无可用的无线配对记录，请插线后点「转无线」")
+
+    endpoints = {}
+    for answer in await browse_remotepairing(timeout=4):
+        if tunnel_service._match_remote_pair_record(answer, {udid: irk}) == udid:
+            endpoints.update(dict.fromkeys((host, answer.port) for host in _remote_addresses(answer)))
+    if not endpoints:
+        raise DeviceNotFoundError(udid, "没有发现与配对记录匹配的 iPhone 无线地址")
+
+    errors = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 10
+    # PMD 11.58 的 listener TCP 是同步连接，外层 asyncio.timeout 无法中断它。
+    original_connect = tunnel_service.create_connection
+    tunnel_service.create_connection = partial(original_connect, timeout=2.5)
+    try:
+        for host, port in endpoints:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            stage = "连接 RemotePairing 服务或验证配对"
+
+            async def remote_provider():
+                nonlocal stage
+                service = await tunnel_service.create_core_device_tunnel_service_using_remotepairing(
+                    udid, host, port, autopair=False, connect_timeout=2
+                )
+                stage = "建立 TCP/RSD 隧道"
+                return userspace_tunnel.TunnelProvider(service)
+
+            tunnel = userspace_tunnel.UserspaceRsdTunnel(provider_factory=remote_provider)
+            try:
+                async with asyncio.timeout(min(5, remaining)):
+                    rsd = await tunnel.aopen()
+                return rsd, tunnel
+            except (OSError, ConnectionTerminatedError, asyncio.IncompleteReadError) as exc:
+                errors.append(f"{stage}失败（{host}）：{str(exc) or type(exc).__name__}")
+    finally:
+        tunnel_service.create_connection = original_connect
+    raise OSError("；".join(errors) or "RemotePairing 连接超时")
+
+
 async def _open_rsd(udid: str, wireless: bool) -> tuple[RemoteServiceDiscoveryService, Any, str]:
     """Open a userspace RSD tunnel over USB or RemotePairing Wi-Fi."""
     if not wireless:
@@ -216,8 +341,7 @@ async def _open_rsd(udid: str, wireless: bool) -> tuple[RemoteServiceDiscoverySe
             raise RuntimeError("尚未信任此电脑：请解锁 iPhone，在弹窗中点击「信任」并输入锁屏密码") from exc
 
         try:
-            if not lockdown.paired:
-                await lockdown.pair()
+            await _ensure_usb_pairing(lockdown)
             dev_mode = await lockdown.get_developer_mode_status()
             if not dev_mode:
                 with contextlib.suppress(Exception):
@@ -235,19 +359,17 @@ async def _open_rsd(udid: str, wireless: bool) -> tuple[RemoteServiceDiscoverySe
         rsd = await tunnel.aopen()
         return rsd, tunnel, device_name
 
-    # Wireless path: try RemotePairing tunnel over the network.
     try:
-        tunnel = userspace_tunnel.UserspaceRsdTunnel(
-            serial=udid, remotepairing_fallback=True, remotepairing=True
-        )
-        rsd = await tunnel.aopen()
+        rsd, tunnel = await _open_remote_tunnel(udid)
         return rsd, tunnel, "iPhone (Wi-Fi)"
-    except (UserspaceTunnelUnavailableError, DeviceNotFoundError) as remote_error:
+    except (UserspaceTunnelUnavailableError, DeviceNotFoundError, OSError) as remote_error:
         # Apple Devices can also publish a trusted Wi-Fi device through usbmux.
         # Explicitly require Network here: plugged-in USB must never pass a Wi-Fi test.
         async def network_provider():
             lockdown = await create_using_usbmux(serial=udid, autopair=False, connection_type="Network")
             try:
+                if not lockdown.paired:
+                    raise NotPairedError("Apple Devices 未建立受信任的 Wi-Fi 会话")
                 proxy = await tunnel_service.CoreDeviceTunnelProxy.create(lockdown)
                 return userspace_tunnel.TunnelProvider(proxy, lockdown)
             except BaseException:
@@ -286,8 +408,7 @@ async def cmd_pair_wireless(udid: str) -> int:
         return 1
 
     try:
-        if not lockdown.paired:
-            await lockdown.pair()
+        await _ensure_usb_pairing(lockdown)
         with contextlib.suppress(Exception):
             await lockdown.set_enable_wifi_connections(True)
         service = await RemotePairingLockdownService.create(lockdown)
@@ -312,6 +433,9 @@ async def cmd_pair_wireless(udid: str) -> int:
 
         _emit({"type": "paired", "udid": udid, "serial": f"wifi:{udid}"})
         return 0
+    except PasswordRequiredError:
+        _emit({"type": "error", "message": "请解锁 iPhone，保持 USB 连接后再点「转无线」"})
+        return 1
     except InvalidServiceError:
         try:
             await lockdown.set_enable_wifi_connections(True)
@@ -327,15 +451,188 @@ async def cmd_pair_wireless(udid: str) -> int:
         await lockdown.close()
 
 
+_SCROLL_LOG = "D:/dsh-common/dsh-phone-mirror/.tmp/scroll-debug.log"
+
+
+def _scroll_log(message: str) -> None:
+    """滚动调试日志：追加一行到 .tmp 下的文件，失败时静默丢弃。"""
+    line = f"{time.strftime('%H:%M:%S')} {message}\n"
+    for path in (Path(_SCROLL_LOG), Path(__file__).resolve().parent.parent / ".tmp" / "scroll-debug.log"):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+            return
+        except Exception:
+            continue
+
+
+def _clean_message(text: str) -> str:
+    """错误信息里可能带协议原始字节，去掉不可打印字符并截断，避免界面上出现乱码。"""
+    cleaned = "".join(ch for ch in str(text) if ch.isprintable() or ch in " \n\t")
+    return " ".join(cleaned.split())[:300] or "连接失败"
+
+
+def _scroll_chunks(dx: int, dy: int) -> list[tuple[int, int]]:
+    """把一次合并后的增量拆成 int8 范围内的若干段，超出的量不丢失。"""
+    chunks = []
+    while dx or dy:
+        chunk_x = max(-127, min(127, dx))
+        chunk_y = max(-127, min(127, dy))
+        chunks.append((chunk_x, chunk_y))
+        dx, dy = dx - chunk_x, dy - chunk_y
+    return chunks
+
+
+def _scroll_report(dx: int, dy: int, phase: int, momentum: int = 0) -> bytes:
+    """21 字节 Scroll 报告：ID 7，阶段、增量、16.16 加速度与 48 位时间戳。"""
+    timestamp = time.monotonic_ns() & ((1 << 48) - 1)
+    return (
+        bytes([7, phase, momentum]) + struct.pack("<bb", dx, dy)
+        + struct.pack("<ii", dx * 65536, dy * 65536)
+        + timestamp.to_bytes(6, "little") + b"\x00\x00"
+    )
+
+
 class MirrorScreenStreamServer(ScreenStreamServer):
+    _scroll_active = False
+    _scroll_end_handle = None
+    _scroll_descriptors_logged = False
+
+    async def _ensure_keyboard(self) -> None:
+        """用设备自带的键盘服务，而不是主机注册的虚拟键盘。
+
+        虚拟键盘会顶掉手机输入法；发到自带键盘服务上的按键仍由手机输入法处理。
+        """
+        await self._ensure_hid()
+        if self._kb_service_id is not None:
+            return
+        async with self._hid_lock:
+            if self._kb_service_id is not None:
+                return
+            response = await self._uhs.list_connected_services()
+            for service in response.get("connectedServices", []):
+                if service.get("DeviceTypeHint") == "Keyboard" and "_ServiceID" in service:
+                    self._kb_service_id = int(service["_ServiceID"])
+                    return
+            self._kb_service_id = await self._uhs.create_keyboard_service()
+
+    async def _send_scroll(self, scroll: dict[str, Any]) -> None:
+        # 客户端 dy 为「向上为正」（scrcpy 习惯），实测设备方向相反，
+        # 所以对 x/y 取反；一格滚轮（客户端 1 单位）放大约 36 个设备增量。
+        scale = 36
+        dx = -max(-127, min(127, round(float(scroll.get("dx", 0)) * scale)))
+        dy = -max(-127, min(127, round(float(scroll.get("dy", 0)) * scale)))
+        _scroll_log(f"received {scroll!r} -> wire dx={dx} dy={dy} active={self._scroll_active}")
+        if dx == 0 and dy == 0:
+            return
+        pointer = build_digitizer_report(
+            round(float(scroll.get("x", 0.5)) * 65536),
+            round(float(scroll.get("y", 0.5)) * 65536),
+        )
+        await self._ensure_hid()
+        if not self._scroll_descriptors_logged:
+            self._scroll_descriptors_logged = True
+            try:
+                services = await self._uhs.list_connected_services()
+                for descriptor in services.get("connectedServices", []):
+                    _scroll_log(f"descriptor {descriptor!r}")
+            except Exception as exc:
+                _scroll_log(f"descriptor query failed: {exc!r}")
+        service = DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE
+        # 与抓包一致的持续手势：首个增量走 mayBegin+began，后续增量走 changed，
+        # 停止 120ms 后发 ended；不发 momentum，滚轮停下即停住。
+        phase = 0x02 if self._scroll_active else 0x01
+        reports = [pointer] if self._scroll_active else [
+            pointer,
+            _scroll_report(0, 0, 0x80),
+        ]
+        for index, (chunk_x, chunk_y) in enumerate(_scroll_chunks(dx, dy)):
+            reports.append(_scroll_report(chunk_x, chunk_y, 0x02 if index else phase))
+        async with self._hid_lock:
+            uhs = self._uhs
+            try:
+                for report in reports:
+                    await uhs.send_report(service, report)
+                    _scroll_log(f"sent svc={service} report={report.hex()}")
+                self._scroll_active = True
+            except Exception as exc:
+                _scroll_log(f"send failed: {exc!r}")
+                raise
+        self._schedule_scroll_end()
+
+    def _schedule_scroll_end(self) -> None:
+        if self._scroll_end_handle is not None:
+            self._scroll_end_handle.cancel()
+        loop = asyncio.get_running_loop()
+        self._scroll_end_handle = loop.call_later(0.12, self._scroll_end)
+
+    def _scroll_end(self) -> None:
+        self._scroll_end_handle = None
+
+        async def close() -> None:
+            async with self._hid_lock:
+                if not self._scroll_active or self._uhs is None:
+                    return
+                try:
+                    await self._uhs.send_report(
+                        DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE, _scroll_report(0, 0, 0x04)
+                    )
+                    _scroll_log("scroll session ended")
+                except Exception as exc:
+                    _scroll_log(f"end failed: {exc!r}")
+                finally:
+                    self._scroll_active = False
+
+        asyncio.create_task(close())
+
+    async def _stop_hid(self) -> None:
+        self._scroll_active = False
+        if self._scroll_end_handle is not None:
+            self._scroll_end_handle.cancel()
+            self._scroll_end_handle = None
+        await super()._stop_hid()
+
+    async def _paste_text(self, text: str) -> None:
+        """电脑输入法提交的文本：写手机剪贴板后按 ⌘V 四段和弦粘贴进手机。
+
+        HID 键盘打不出 Unicode，中文等提交文本只能经剪贴板进手机（与 Device Hub / ipb 一致）。
+        整个动作在 /key 的单一 HID 队列里执行：剪贴板写失败就跳过和弦，绝不粘贴旧内容；
+        ⌘V 必须按 ⌘ → ⌘+V → V → 抬起 四段发送，两段式会被 iOS 当成裸 v。
+        """
+        try:
+            await self._ensure_keyboard()
+        except Exception as exc:
+            _scroll_log(f"paste: keyboard service failed: {exc!r}")
+            return
+        try:
+            async with PasteboardService(self._rsd) as service:
+                await asyncio.wait_for(service.set_text(text[:65536]), timeout=2.0)
+        except Exception as exc:
+            _scroll_log(f"paste: clipboard write failed: {exc!r}")
+            return
+        # 等剪贴板变化在系统内生效后再粘贴。
+        await asyncio.sleep(0.05)
+        for step in ([0xE3], [0xE3, 0x19], [0x19], []):
+            await self._uhs.send_keyboard(self._kb_service_id, step)
+            await asyncio.sleep(0.02)
+
     async def _handle_key(self, body: bytes) -> tuple[int, bytes]:
         try:
             data = json.loads(body)
-            detach = data.get("detach") is True
             recents = data.get("recents") is True
+            scroll = data.get("scroll")
+            paste = data.get("paste")
         except (ValueError, AttributeError):
-            detach = False
             recents = False
+            scroll = None
+            paste = None
+        if isinstance(paste, str) and paste:
+            await self._paste_text(paste)
+            return 200, b"ok"
+        if isinstance(scroll, dict):
+            await self._send_scroll(scroll)
+            return 200, b"ok"
         if recents:
             # App 切换器 = 连按两次 Home（Consumer 页 0x0C / 用法 0x40）。
             await self._ensure_hid()
@@ -346,16 +643,7 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                 await indigo.send_button(0x0C, 0x40, HID_BUTTON_STATE_UP)
                 await asyncio.sleep(0.12)
             return 200, b"ok"
-        if not detach:
-            return await super()._handle_key(body)
-        async with self._hid_lock:
-            if self._kb_service_id is not None and self._uhs is not None:
-                # 关闭 UHS 即注销虚拟键盘，下次触控会重新打开且不带键盘。
-                await self._uhs.close()
-                self._uhs = None
-                self._kb_service_id = None
-                self._touch_service_id = None
-        return 200, b"ok"
+        return await super()._handle_key(body)
 
 
 async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
@@ -422,11 +710,30 @@ async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
                 await server._ensure_hid()
 
         hid_warm = asyncio.create_task(warm_hid())
-        await serve_task
-        hid_warm.cancel()
+        if os.environ.get("PHONE_MIRROR_STDIN_QUIT") != "1" or sys.stdin is None:
+            await serve_task
+            hid_warm.cancel()
+            return 0
+
+        stop = asyncio.Event()
+        stdin_task = asyncio.create_task(_watch_stdin(stop))
+        stop_wait = asyncio.create_task(stop.wait())
+        try:
+            done, _ = await asyncio.wait({serve_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if serve_task in done:
+                exc = serve_task.exception()
+                if exc:
+                    raise exc
+        finally:
+            hid_warm.cancel()
+            stop_wait.cancel()
+            stdin_task.cancel()
+            serve_task.cancel()
+            with contextlib.suppress(BaseException):
+                await serve_task
         return 0
     except Exception as exc:
-        _emit({"type": "error", "message": str(exc)})
+        _emit({"type": "error", "message": _clean_message(exc)})
         return 1
     finally:
         if rsd is not None:
