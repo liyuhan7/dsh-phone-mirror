@@ -20,7 +20,7 @@ Under the hood it supports two decoupled paths:
 - **Audio forwarding**: Opus 48 kHz stereo through an AudioWorklet ring buffer, 80 ms startup buffer that grows to 240 ms on underrun; devices without capturable audio fall back to a silent session.
 - **Decoding on a worker thread**: the stream, H.264 decoding, drawing and audio decoding all run in a Worker, so DSH spending the main thread on chat rendering or file writes does not stall the panel; without a Worker it falls back to the main thread.
 - **Automatic fallback**: when scrcpy cannot start, the plugin polls `adb screencap` instead (260 ms per frame by default), which is slow but works on almost any device adb can reach.
-- **From cable to Wi-Fi**: the panel's "转无线" switches USB debugging to TCP and connects automatically, so you can unplug and keep mirroring; stock Android 11+ can also pair through Wireless debugging.
+- **From cable to Wi-Fi**: on Android the panel's "转无线" switches USB debugging to TCP and connects automatically; on iOS it pairs over USB, then you unplug and press Connect (the address was already learned, so it connects instantly)
 
 Panel labels are Chinese only; the plugin does not ship translations yet.
 
@@ -68,7 +68,7 @@ If adb is already installed, point `adbPath` at it instead.
 
 ```text
 click / drag / wheel    operate the device directly
-keyboard                iOS: click the screen to take over, then just type — pinyin composes on the phone, digits/space/enter pick candidates, Esc puts the phone keyboard away
+keyboard                iOS: click the screen to take over, then just type — pinyin composes on the phone, digits/space/enter pick candidates; changing the phone's orientation hands the on-screen keyboard back
                         Android: click the screen to capture it; Esc releases focus
 fullscreen              the "全屏" toolbar button
 quality                 smooth 720 / standard 1080 / high 1600
@@ -102,6 +102,7 @@ Override in the profile's `cordis.patch.yml`:
 | `audio` | `true` | Forward device audio; unsupported devices start silent next time |
 | `adbPath` | empty | Custom adb path, the bundled one when empty |
 | `serverJar` | empty | Custom `scrcpy-server.jar` path |
+| `iosWirelessHost` | empty | Manual fallback for the iPhone's wireless address; normally learned automatically while USB-connected |
 
 ## FAQ
 
@@ -116,6 +117,10 @@ The desktop profile is owned by the Electron app. Edit that profile's `package.j
 **No sound**
 
 Check the speaker button first: grey means this session never got audio — see `session.audio` and `session.audioCodec` at `/dsh-phone-mirror/api/status`. If the button is enabled but you hear nothing, check the computer volume, the device volume, and whether the app that is playing forbids capture.
+
+**iPhone wireless connect fails with "no RemotePairing broadcast"**
+
+Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address automatically while it is connected over USB (packet capture on the device, verified over TCP) and dials that address directly — no mDNS involved. When the phone's IP changes, connect over USB once to refresh; as a last resort set `iosWirelessHost` manually.
 
 **Black picture, or a single-digit frame rate**
 

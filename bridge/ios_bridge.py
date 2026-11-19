@@ -28,6 +28,7 @@ import struct
 import sys
 import tempfile
 import time
+from collections import Counter
 from functools import partial
 from pathlib import Path
 from typing import Any, Optional
@@ -106,18 +107,17 @@ from pymobiledevice3.exceptions import (  # noqa: E402
 from pymobiledevice3.lockdown import create_using_usbmux  # noqa: E402
 from pymobiledevice3.remote import tunnel_service, userspace_tunnel  # noqa: E402
 from pymobiledevice3.remote.core_device.display_service import DisplayService  # noqa: E402
+from pymobiledevice3.remote.core_device.device_info import DeviceInfoService  # noqa: E402
+from pymobiledevice3.remote.core_device import hid_service as hs  # noqa: E402
 from pymobiledevice3.remote.core_device.hid_service import (  # noqa: E402
     DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE,
     HID_BUTTON_STATE_DOWN,
     HID_BUTTON_STATE_UP,
     build_digitizer_report,
 )
-from pymobiledevice3.remote.core_device.pasteboard_service import (  # noqa: E402
-    UTI_PLAIN_TEXT,
-    UTI_TEXT,
-    UTI_UTF8_PLAIN_TEXT,
-    PasteboardService,
-)
+
+# 注册虚拟键盘后的挂载等待：0.12s 足够，缩短切回键盘时的首键延迟。
+hs.KEYBOARD_ATTACH_SETTLE_SECONDS = 0.12
 from pymobiledevice3.remote.core_device.screen_stream import (  # noqa: E402
     ScreenStreamServer,
     hevc_decoder_configuration_record,
@@ -287,7 +287,46 @@ def _lan_ipv6_scopes(ipv4):
     return list(dict.fromkeys(scope for _, scope in sorted(matches, reverse=True)))
 
 
-async def _open_remote_tunnel(udid: str):
+# 无线发现与建隧道的总窗口，覆盖多轮 mDNS 查询。
+_TUNNEL_WINDOW = 20.0
+_BROWSE_WINDOW = 4.0
+# RemotePairing 端口固定，禁组播的网络可以直接按 IP 连。
+_REMOTE_PAIRING_PORT = 49152
+
+
+def _pinned_endpoints(address: str) -> list[tuple[str, int]]:
+    """把配置里的无线地址解析成 endpoint，允许 ``192.168.1.5`` 或 ``192.168.1.5:49152``。"""
+    address = address.strip()
+    if not address:
+        return []
+    host, _, port = address.rpartition(":")
+    if host and port.isdigit():
+        return [(host, int(port))]
+    return [(address, _REMOTE_PAIRING_PORT)]
+
+
+
+async def _attempt_remote_endpoint(udid: str, host: str, port: int, timeout: float):
+    """连一个 RemotePairing 地址并建 RSD 隧道；失败抛出带阶段信息的 OSError。"""
+    stage = "连接 RemotePairing 服务或验证配对"
+
+    async def remote_provider():
+        nonlocal stage
+        service = await tunnel_service.create_core_device_tunnel_service_using_remotepairing(
+            udid, host, port, autopair=False, connect_timeout=2
+        )
+        stage = "建立 TCP/RSD 隧道"
+        return userspace_tunnel.TunnelProvider(service)
+
+    tunnel = userspace_tunnel.UserspaceRsdTunnel(provider_factory=remote_provider)
+    try:
+        async with asyncio.timeout(timeout):
+            return await tunnel.aopen(), tunnel
+    except (OSError, ConnectionTerminatedError, asyncio.IncompleteReadError) as exc:
+        raise OSError(f"{stage}失败（{host}:{port}）：{str(exc) or type(exc).__name__}") from exc
+
+
+async def _open_remote_tunnel(udid: str, pinned_address: str = ""):
     record = pmd_pair_records.get_local_pairing_record(
         pmd_pair_records.get_remote_pairing_record_filename(udid), _PMD_HOME
     )
@@ -295,47 +334,76 @@ async def _open_remote_tunnel(udid: str):
     if not isinstance(irk, bytes) or len(irk) != 16:
         raise UserspaceTunnelUnavailableError("无可用的无线配对记录，请插线后点「转无线」")
 
-    endpoints = {}
-    for answer in await browse_remotepairing(timeout=4):
-        if tunnel_service._match_remote_pair_record(answer, {udid: irk}) == udid:
-            endpoints.update(dict.fromkeys((host, answer.port) for host in _remote_addresses(answer)))
-    if not endpoints:
-        raise DeviceNotFoundError(udid, "没有发现与配对记录匹配的 iPhone 无线地址")
-
-    errors = []
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 10
+    deadline = loop.time() + _TUNNEL_WINDOW
     # PMD 11.58 的 listener TCP 是同步连接，外层 asyncio.timeout 无法中断它。
     original_connect = tunnel_service.create_connection
     tunnel_service.create_connection = partial(original_connect, timeout=2.5)
+    attempted: list[str] = []
+    failures: dict[str, str] = {}
+    answers = 0
     try:
-        for host, port in endpoints:
+        # 手填或已学到的地址优先，直接按 IP 连。
+        for host, port in _pinned_endpoints(pinned_address):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
-            stage = "连接 RemotePairing 服务或验证配对"
-
-            async def remote_provider():
-                nonlocal stage
-                service = await tunnel_service.create_core_device_tunnel_service_using_remotepairing(
-                    udid, host, port, autopair=False, connect_timeout=2
-                )
-                stage = "建立 TCP/RSD 隧道"
-                return userspace_tunnel.TunnelProvider(service)
-
-            tunnel = userspace_tunnel.UserspaceRsdTunnel(provider_factory=remote_provider)
+            attempted.append(f"{host}:{port}")
             try:
-                async with asyncio.timeout(min(5, remaining)):
-                    rsd = await tunnel.aopen()
-                return rsd, tunnel
-            except (OSError, ConnectionTerminatedError, asyncio.IncompleteReadError) as exc:
-                errors.append(f"{stage}失败（{host}）：{str(exc) or type(exc).__name__}")
+                return await _attempt_remote_endpoint(udid, host, port, min(5.0, remaining))
+            except OSError as exc:
+                failures[f"{host}:{port}"] = str(exc)
+        while loop.time() < deadline:
+            started = loop.time()
+            endpoints = {}
+            seen = 0
+            window = max(1.0, min(_BROWSE_WINDOW, deadline - started))
+            for answer in await browse_remotepairing(timeout=window):
+                seen += 1
+                if tunnel_service._match_remote_pair_record(answer, {udid: irk}) == udid:
+                    endpoints.update(dict.fromkeys((host, answer.port) for host in _remote_addresses(answer)))
+            answers = max(answers, seen)
+            for host, port in endpoints:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                endpoint = f"{host}:{port}"
+                if endpoint not in attempted:
+                    attempted.append(endpoint)
+                try:
+                    return await _attempt_remote_endpoint(udid, host, port, min(5.0, remaining))
+                except OSError as exc:
+                    failures[endpoint] = str(exc)
+            # 浏览立即返回但没有答案时退出，避免空转。
+            if not endpoints and loop.time() - started < 0.5:
+                await asyncio.sleep(0.5)
     finally:
         tunnel_service.create_connection = original_connect
-    raise OSError("；".join(errors) or "RemotePairing 连接超时")
+
+    if not attempted:
+        if pinned_address:
+            raise DeviceNotFoundError(
+                udid, f"配置的无线地址 {pinned_address} 不可用，且无线网络上没有收到 RemotePairing 广播",
+            )
+        if not answers:
+            raise DeviceNotFoundError(
+                udid,
+                "无线网络上没有收到任何 RemotePairing 广播（mDNS 查询无应答）："
+                "确认 iPhone 与电脑在同一局域网、手机已解锁，电脑没开 VPN，防火墙没拦截组播。"
+                "禁组播的校园网请在插件设置里填「iPhone 无线地址」按 IP 直连",
+            )
+        raise DeviceNotFoundError(
+            udid,
+            f"收到 {answers} 条无线广播但没有一条对得上本机配对记录：插线后点一次「转无线」重建配对",
+        )
+    advice = "；若手机 IP 变了，插回 USB 连一次（或点「转无线」）即可自动更新" if pinned_address else ""
+    raise OSError(
+        f"{'；'.join(list(failures.values())[:4]) or 'RemotePairing 连接超时'}"
+        f"（{len(attempted)} 个地址均失败：{'、'.join(attempted[:4])}{advice}）"
+    )
 
 
-async def _open_rsd(udid: str, wireless: bool) -> tuple[RemoteServiceDiscoveryService, Any, str]:
+async def _open_rsd(udid: str, wireless: bool, pinned_address: str = "") -> tuple[RemoteServiceDiscoveryService, Any, str]:
     """Open a userspace RSD tunnel over USB or RemotePairing Wi-Fi."""
     if not wireless:
         try:
@@ -365,7 +433,7 @@ async def _open_rsd(udid: str, wireless: bool) -> tuple[RemoteServiceDiscoverySe
         return rsd, tunnel, device_name
 
     try:
-        rsd, tunnel = await _open_remote_tunnel(udid)
+        rsd, tunnel = await _open_remote_tunnel(udid, pinned_address)
         return rsd, tunnel, "iPhone (Wi-Fi)"
     except (UserspaceTunnelUnavailableError, DeviceNotFoundError, OSError) as remote_error:
         # Apple Devices can also publish a trusted Wi-Fi device through usbmux.
@@ -405,6 +473,75 @@ async def _ensure_ddi_mounted(rsd: RemoteServiceDiscoveryService) -> None:
         logging.getLogger(__name__).warning("auto_mount raised %s; will re-check services", exc)
 
 
+def _frame_src_ipv4(frame: bytes) -> Optional[str]:
+    """以太网帧里 IPv4 包的源地址；非 IPv4 或帧太短返回 None。"""
+    if len(frame) < 34 or struct.unpack("!H", frame[12:14])[0] != 0x0800:
+        return None
+    payload = frame[14:]
+    if len(payload) < 20 or (payload[0] >> 4) != 4:
+        return None
+    return socket.inet_ntoa(payload[12:16])
+
+
+def _local_ipv4s() -> set[str]:
+    """本机所有 IPv4 地址：学习手机地址时把它们从候选里剔除。"""
+    with contextlib.suppress(Exception):
+        import ifaddr
+        return {addr.ip for adapter in ifaddr.get_adapters() for addr in adapter.ips if addr.is_IPv4}
+    return set()
+
+
+def _dominant_wireless_candidates(src_counts: dict[str, int], exclude: set[str]) -> list[str]:
+    """按出现次数降序给出可用的源地址候选，剔除本机/环回/链路本地。"""
+    def usable(ip: str) -> bool:
+        return ip not in exclude and not ip.startswith(("127.", "0.", "169.254."))
+
+    return [ip for ip, _ in sorted(src_counts.items(), key=lambda item: -item[1]) if usable(ip)]
+
+
+def _endpoint_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+async def _learn_wireless_address(lockdown, seconds: float = 6.0) -> Optional[tuple[str, int]]:
+    """USB 连着时用 pcapd 学手机当前的 Wi-Fi 地址，并用 TCP 验证 RemotePairing 端口。
+
+    禁组播的网络（校园网常见）里 mDNS 永远收不到广播，但手机自己的流量一定会
+    暴露它的地址——这是安卓 `adb shell ip -4 addr` 的 iOS 等价物，全程不需要组播。
+    """
+    from pymobiledevice3.services.pcapd import PcapdService
+
+    counts: Counter[str] = Counter()
+    try:
+        async with PcapdService(lockdown) as pcap:
+            stream = pcap.watch(interface_name="en")
+
+            async def pump():
+                async for packet in stream:
+                    src = _frame_src_ipv4(bytes(packet.data))
+                    if src:
+                        counts[src] += 1
+
+            try:
+                await asyncio.wait_for(pump(), timeout=seconds)
+            except asyncio.TimeoutError:
+                pass
+            finally:
+                with contextlib.suppress(Exception):
+                    await stream.aclose()
+    except Exception:
+        return None
+    exclude = _local_ipv4s() | {"0.0.0.0"}
+    for ip in _dominant_wireless_candidates(counts, exclude)[:3]:
+        if _endpoint_reachable(ip, _REMOTE_PAIRING_PORT):
+            return ip, _REMOTE_PAIRING_PORT
+    return None
+
+
 async def cmd_pair_wireless(udid: str) -> int:
     try:
         lockdown = await create_using_usbmux(serial=udid, autopair=False, connection_type="USB")
@@ -436,7 +573,12 @@ async def cmd_pair_wireless(udid: str) -> int:
                 if dst != rec:
                     shutil.copy2(rec, dst)
 
-        _emit({"type": "paired", "udid": udid, "serial": f"wifi:{udid}"})
+        _emit({"type": "stage", "message": "正在读取手机 Wi-Fi 地址（约 6 秒）…"})
+        learned = await _learn_wireless_address(lockdown)
+        _emit({
+            "type": "paired", "udid": udid, "serial": f"wifi:{udid}",
+            **({"wirelessHost": learned[0]} if learned else {}),
+        })
         return 0
     except PasswordRequiredError:
         _emit({"type": "error", "message": "请解锁 iPhone，保持 USB 连接后再点「转无线」"})
@@ -483,82 +625,65 @@ def _scroll_report(dx: int, dy: int, phase: int, momentum: int = 0) -> bytes:
     )
 
 
-def _paste_item(text: str) -> dict[str, Any]:
-    """手机剪贴板条目：UTF-8 文本 + 「临时/敏感」标记。
-
-    org.nspasteboard.TransientType / ConcealedType 是通用标记：剪贴板历史类工具会跳过，
-    系统也知道这条内容不是用户主动复制的，能减少「粘贴自」这类归属提示。
-    """
-    payload = text.encode("utf-8")
-    types = [UTI_UTF8_PLAIN_TEXT, UTI_PLAIN_TEXT, UTI_TEXT]
-    data = {uti: {"data": payload} for uti in types}
-    for marker in ("org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"):
-        types.append(marker)
-        data[marker] = {"data": b""}
-    return {"types": types, "data": data}
-
-
 class MirrorScreenStreamServer(ScreenStreamServer):
     _scroll_active = False
     _scroll_end_handle = None
-    # 粘贴板连接常驻复用：每次粘贴省掉一次 RemoteXPC 连接（几十到上百毫秒）。
-    _pasteboard = None
-
-    async def _ensure_pasteboard(self):
-        if self._pasteboard is None:
-            service = PasteboardService(self._rsd)
-            await service.connect()
-            self._pasteboard = service
-        return self._pasteboard
-
-    async def _drop_pasteboard(self) -> None:
-        service, self._pasteboard = self._pasteboard, None
-        if service is not None:
-            with contextlib.suppress(Exception):
-                await service.close()
-
-    async def _paste_text(self, text: str) -> None:
-        """电脑输入法提交的文本：写手机剪贴板后按 ⌘V 四段和弦粘贴进手机。
-
-        HID 键盘打不出 Unicode，中文只能经剪贴板进手机（与 Device Hub / ipb 一致）。
-        延迟靠三件事压住：粘贴板连接常驻（省掉连接开销）、写完只等 8ms、
-        和弦间隔 15ms，单次粘贴约 60~80ms，不会卡在打字路径上。
-        """
-        try:
-            await self._ensure_keyboard()
-        except Exception:
-            logging.warning("paste: keyboard service failed", exc_info=True)
-            return
-        try:
-            service = await self._ensure_pasteboard()
-            await asyncio.wait_for(service.set([_paste_item(text[:65536])]), timeout=1.5)
-        except Exception:
-            logging.warning("paste: clipboard write failed", exc_info=True)
-            await self._drop_pasteboard()
-            return
-        # 让剪贴板变更在系统内生效，再发和弦。
-        await asyncio.sleep(0.008)
-        for step in ([0xE3], [0xE3, 0x19], [0x19], []):
-            await self._uhs.send_keyboard(self._kb_service_id, step)
-            await asyncio.sleep(0.015)
+    # 键盘走独立 UHS 连接：点画面时只关这一条，触摸那条完全不受影响。
+    _kb_uhs = None
+    # 上一次的朝向（currentDeviceOrientation + currentDeviceNonFlatOrientation）；None 表示还没收到过。
+    _orientation = None
+    # 朝向监听任务：朝向变化时交还输入法。
+    _motion_task = None
 
     async def _ensure_keyboard(self) -> None:
-        """用设备自带的键盘服务，而不是主机注册的虚拟键盘。
+        """在独立连接上注册宿主虚拟键盘。
 
-        虚拟键盘会顶掉手机输入法；发到自带键盘服务上的按键仍由手机输入法处理。
+        按键逐键交给手机输入法处理：拼音在手机上组字、候选条显示在手机上，
+        用电脑键盘的数字/空格/回车选字；软键盘由外接键盘规则收起。
+        注册在独立连接上，注销时只关这一条。
         """
-        await self._ensure_hid()
+        if self._motion_task is None or self._motion_task.done():
+            self._motion_task = asyncio.create_task(self._watch_orientation())
         if self._kb_service_id is not None:
             return
         async with self._hid_lock:
             if self._kb_service_id is not None:
                 return
-            response = await self._uhs.list_connected_services()
-            for service in response.get("connectedServices", []):
-                if service.get("DeviceTypeHint") == "Keyboard" and "_ServiceID" in service:
-                    self._kb_service_id = int(service["_ServiceID"])
+            if self._kb_uhs is None:
+                uhs = hs.UniversalHIDServiceService(self._rsd)
+                await uhs.connect()
+                self._kb_uhs = uhs
+            self._kb_service_id = await self._kb_uhs.create_keyboard_service()
+
+    async def _detach_keyboard(self) -> None:
+        """注销宿主键盘，把软键盘还给手机。
+
+        关闭键盘连接即注销键盘；键盘消失后 iOS 把软键盘还给当前输入框。
+        触摸走另一条连接，不受影响。关闭后预连下一条连接，省掉下次打字的握手。
+        """
+        if self._kb_service_id is None:
+            return
+        async with self._hid_lock:
+            if self._kb_service_id is None:
+                return
+            self._kb_service_id = None
+            uhs, self._kb_uhs = self._kb_uhs, None
+        if uhs is not None:
+            with contextlib.suppress(Exception):
+                await uhs.close()
+        asyncio.create_task(self._warm_keyboard_link())
+
+    async def _warm_keyboard_link(self) -> None:
+        """后台先连好键盘用的 UHS 连接（不注册键盘），缩短下一次打字的首键延迟。"""
+        try:
+            async with self._hid_lock:
+                if self._kb_uhs is not None or self._kb_service_id is not None:
                     return
-            self._kb_service_id = await self._uhs.create_keyboard_service()
+                uhs = hs.UniversalHIDServiceService(self._rsd)
+                await uhs.connect()
+                self._kb_uhs = uhs
+        except Exception:
+            logging.debug("keyboard link warm-up failed", exc_info=True)
 
     async def _send_scroll(self, scroll: dict[str, Any]) -> None:
         # 客户端 dy 为「向上为正」（scrcpy 习惯），实测设备方向相反，
@@ -613,11 +738,49 @@ class MirrorScreenStreamServer(ScreenStreamServer):
 
         asyncio.create_task(close())
 
+    async def _watch_orientation(self) -> None:
+        """跟随 displayinfoupdates 推送，手机朝向变化时把键盘交还给手机输入法。
+
+        只对朝向变化生效：拿起、转方向、在桌面上转身都会触发，纯平移不会。
+        """
+        try:
+            async with DeviceInfoService(self._rsd) as service:
+                async for element in service.display_info_updates():
+                    orientation = (element or {}).get("orientation")
+                    if isinstance(orientation, dict) and self._on_orientation(orientation):
+                        await self._detach_keyboard()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.debug("orientation watcher stopped", exc_info=True)
+
+    def _on_orientation(self, orientation: dict[str, Any]) -> bool:
+        """记录朝向；返回 True 表示朝向变了（手机被拿起或转动过）。"""
+        current = orientation.get("currentDeviceOrientation")
+        if not isinstance(current, str):
+            return False
+        # 两个字段一起比较：平放时 currentDeviceOrientation 恒为 faceUp，
+        # nonFlat 反映桌面上的转动。
+        state = (current, orientation.get("currentDeviceNonFlatOrientation"))
+        previous = self._orientation
+        self._orientation = state
+        return previous is not None and previous != state
+
     async def _stop_hid(self) -> None:
         self._scroll_active = False
+        if self._motion_task is not None:
+            self._motion_task.cancel()
+            self._motion_task = None
         if self._scroll_end_handle is not None:
             self._scroll_end_handle.cancel()
             self._scroll_end_handle = None
+        # 一并关掉键盘连接，避免设备上残留已注册的键盘。
+        async with self._hid_lock:
+            self._kb_service_id = None
+            kb_uhs, self._kb_uhs = self._kb_uhs, None
+        if kb_uhs is not None:
+            with contextlib.suppress(Exception):
+                await kb_uhs.close()
         await super()._stop_hid()
 
     async def _handle_key(self, body: bytes) -> tuple[int, bytes]:
@@ -625,14 +788,9 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             data = json.loads(body)
             recents = data.get("recents") is True
             scroll = data.get("scroll")
-            paste = data.get("paste")
         except (ValueError, AttributeError):
             recents = False
             scroll = None
-            paste = None
-        if isinstance(paste, str) and paste:
-            await self._paste_text(paste)
-            return 200, b"ok"
         if isinstance(scroll, dict):
             await self._send_scroll(scroll)
             return 200, b"ok"
@@ -646,14 +804,27 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                 await indigo.send_button(0x0C, 0x40, HID_BUTTON_STATE_UP)
                 await asyncio.sleep(0.12)
             return 200, b"ok"
-        return await super()._handle_key(body)
+        # 普通按键：键盘在独立连接上（见 _ensure_keyboard），点过画面后首键会重新注册。
+        try:
+            usages = [int(value) for value in json.loads(body).get("usages", [])]
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return 400, f"invalid key request: {exc}".encode()
+        try:
+            await self._ensure_keyboard()
+        except Exception:
+            logging.warning("keyboard attach failed", exc_info=True)
+            return 503, b"keyboard unavailable"
+        if self._kb_uhs is None or self._kb_service_id is None:
+            return 503, b"keyboard unavailable"
+        await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
+        return 200, b"ok"
 
 
-async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
+async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "") -> int:
     stack_ctx = None
     rsd: Optional[RemoteServiceDiscoveryService] = None
     try:
-        rsd, stack_ctx, device_name = await _open_rsd(udid, wireless)
+        rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host)
         if DisplayService.SERVICE_NAME not in rsd.peer_info.get("Services", {}):
             await _ensure_ddi_mounted(rsd)
             with contextlib.suppress(Exception):
@@ -661,7 +832,7 @@ async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
             if stack_ctx is not None:
                 with contextlib.suppress(Exception):
                     await stack_ctx.aclose()
-            rsd, stack_ctx, device_name = await _open_rsd(udid, wireless)
+            rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host)
 
         version_str = str(rsd.product_version)
         major = int(version_str.split(".")[0]) if version_str and version_str[0].isdigit() else 0
@@ -677,7 +848,10 @@ async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
             bind="127.0.0.1",
             http_port=port,
             audio_default_on=True,
-            motion_idr=True,
+            # pmd 的 motion-IDR 每秒多发一个关键帧；在持续运动（看视频）时这批关键帧
+            # 压力会把设备编码器压停，表现为画面突然冻住。关掉它换取稳定，
+            # 分辨率收缩的恢复交给前端的补偿逻辑。
+            motion_idr=False,
         )
 
         serve_task = asyncio.create_task(server.serve())
@@ -713,6 +887,21 @@ async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
                 await server._ensure_hid()
 
         hid_warm = asyncio.create_task(warm_hid())
+
+        # USB 会话期间学习手机 Wi-Fi 地址，供拔线后的无线直连使用。
+        async def report_wireless_address() -> None:
+            with contextlib.suppress(Exception):
+                address_lockdown = await create_using_usbmux(serial=udid, autopair=False)
+                try:
+                    learned = await _learn_wireless_address(address_lockdown)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await address_lockdown.close()
+                if learned:
+                    _emit({"type": "wireless-address", "udid": udid, "host": learned[0], "port": learned[1]})
+
+        if not wireless:
+            asyncio.create_task(report_wireless_address())
         if os.environ.get("PHONE_MIRROR_STDIN_QUIT") != "1" or sys.stdin is None:
             await serve_task
             hid_warm.cancel()
@@ -721,13 +910,33 @@ async def cmd_serve(udid: str, port: int, wireless: bool) -> int:
         stop = asyncio.Event()
         stdin_task = asyncio.create_task(_watch_stdin(stop))
         stop_wait = asyncio.create_task(stop.wait())
+
+        # pmd 自带停滞看门狗，但用完重启次数后会永久放弃，界面就停在最后一帧。
+        # 这里把它升级成会话重启：退出进程，宿主按无线恢复逻辑重新建会话。
+        async def watch_stream_stall() -> str:
+            loop = asyncio.get_running_loop()
+            limit = getattr(pmd_screen_stream, "_MAX_STALL_RESTARTS", 3)
+            while True:
+                await asyncio.sleep(3)
+                if server._active_service is None:
+                    continue
+                idle = loop.time() - getattr(server, "_last_good_au_t", loop.time())
+                if idle > 12 and getattr(server, "_consecutive_restarts", 0) >= limit:
+                    return f"画面流停滞 {idle:.0f} 秒且自动重启无效，正在重连"
+
+        stall_task = asyncio.create_task(watch_stream_stall())
         try:
-            done, _ = await asyncio.wait({serve_task, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                {serve_task, stop_wait, stall_task}, return_when=asyncio.FIRST_COMPLETED
+            )
             if serve_task in done:
                 exc = serve_task.exception()
                 if exc:
                     raise exc
+            if stall_task in done and not stop.is_set():
+                raise RuntimeError(stall_task.result())
         finally:
+            stall_task.cancel()
             hid_warm.cancel()
             stop_wait.cancel()
             stdin_task.cancel()
@@ -756,6 +965,7 @@ def main() -> int:
     serve_p.add_argument("--udid", required=True)
     serve_p.add_argument("--port", type=int, required=True)
     serve_p.add_argument("--wireless", action="store_true")
+    serve_p.add_argument("--host", default="")
 
     pair_p = sub.add_parser("pair-wireless")
     pair_p.add_argument("--udid", required=True)
@@ -763,7 +973,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "pair-wireless":
         return asyncio.run(cmd_pair_wireless(args.udid))
-    return asyncio.run(cmd_serve(args.udid, args.port, args.wireless))
+    return asyncio.run(cmd_serve(args.udid, args.port, args.wireless, args.host))
 
 
 if __name__ == "__main__":
