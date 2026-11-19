@@ -112,7 +112,12 @@ from pymobiledevice3.remote.core_device.hid_service import (  # noqa: E402
     HID_BUTTON_STATE_UP,
     build_digitizer_report,
 )
-from pymobiledevice3.remote.core_device.pasteboard_service import PasteboardService  # noqa: E402
+from pymobiledevice3.remote.core_device.pasteboard_service import (  # noqa: E402
+    UTI_PLAIN_TEXT,
+    UTI_TEXT,
+    UTI_UTF8_PLAIN_TEXT,
+    PasteboardService,
+)
 from pymobiledevice3.remote.core_device.screen_stream import (  # noqa: E402
     ScreenStreamServer,
     hevc_decoder_configuration_record,
@@ -451,22 +456,6 @@ async def cmd_pair_wireless(udid: str) -> int:
         await lockdown.close()
 
 
-_SCROLL_LOG = "D:/dsh-common/dsh-phone-mirror/.tmp/scroll-debug.log"
-
-
-def _scroll_log(message: str) -> None:
-    """滚动调试日志：追加一行到 .tmp 下的文件，失败时静默丢弃。"""
-    line = f"{time.strftime('%H:%M:%S')} {message}\n"
-    for path in (Path(_SCROLL_LOG), Path(__file__).resolve().parent.parent / ".tmp" / "scroll-debug.log"):
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line)
-            return
-        except Exception:
-            continue
-
-
 def _clean_message(text: str) -> str:
     """错误信息里可能带协议原始字节，去掉不可打印字符并截断，避免界面上出现乱码。"""
     cleaned = "".join(ch for ch in str(text) if ch.isprintable() or ch in " \n\t")
@@ -494,10 +483,64 @@ def _scroll_report(dx: int, dy: int, phase: int, momentum: int = 0) -> bytes:
     )
 
 
+def _paste_item(text: str) -> dict[str, Any]:
+    """手机剪贴板条目：UTF-8 文本 + 「临时/敏感」标记。
+
+    org.nspasteboard.TransientType / ConcealedType 是通用标记：剪贴板历史类工具会跳过，
+    系统也知道这条内容不是用户主动复制的，能减少「粘贴自」这类归属提示。
+    """
+    payload = text.encode("utf-8")
+    types = [UTI_UTF8_PLAIN_TEXT, UTI_PLAIN_TEXT, UTI_TEXT]
+    data = {uti: {"data": payload} for uti in types}
+    for marker in ("org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"):
+        types.append(marker)
+        data[marker] = {"data": b""}
+    return {"types": types, "data": data}
+
+
 class MirrorScreenStreamServer(ScreenStreamServer):
     _scroll_active = False
     _scroll_end_handle = None
-    _scroll_descriptors_logged = False
+    # 粘贴板连接常驻复用：每次粘贴省掉一次 RemoteXPC 连接（几十到上百毫秒）。
+    _pasteboard = None
+
+    async def _ensure_pasteboard(self):
+        if self._pasteboard is None:
+            service = PasteboardService(self._rsd)
+            await service.connect()
+            self._pasteboard = service
+        return self._pasteboard
+
+    async def _drop_pasteboard(self) -> None:
+        service, self._pasteboard = self._pasteboard, None
+        if service is not None:
+            with contextlib.suppress(Exception):
+                await service.close()
+
+    async def _paste_text(self, text: str) -> None:
+        """电脑输入法提交的文本：写手机剪贴板后按 ⌘V 四段和弦粘贴进手机。
+
+        HID 键盘打不出 Unicode，中文只能经剪贴板进手机（与 Device Hub / ipb 一致）。
+        延迟靠三件事压住：粘贴板连接常驻（省掉连接开销）、写完只等 8ms、
+        和弦间隔 15ms，单次粘贴约 60~80ms，不会卡在打字路径上。
+        """
+        try:
+            await self._ensure_keyboard()
+        except Exception:
+            logging.warning("paste: keyboard service failed", exc_info=True)
+            return
+        try:
+            service = await self._ensure_pasteboard()
+            await asyncio.wait_for(service.set([_paste_item(text[:65536])]), timeout=1.5)
+        except Exception:
+            logging.warning("paste: clipboard write failed", exc_info=True)
+            await self._drop_pasteboard()
+            return
+        # 让剪贴板变更在系统内生效，再发和弦。
+        await asyncio.sleep(0.008)
+        for step in ([0xE3], [0xE3, 0x19], [0x19], []):
+            await self._uhs.send_keyboard(self._kb_service_id, step)
+            await asyncio.sleep(0.015)
 
     async def _ensure_keyboard(self) -> None:
         """用设备自带的键盘服务，而不是主机注册的虚拟键盘。
@@ -523,7 +566,6 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         scale = 36
         dx = -max(-127, min(127, round(float(scroll.get("dx", 0)) * scale)))
         dy = -max(-127, min(127, round(float(scroll.get("dy", 0)) * scale)))
-        _scroll_log(f"received {scroll!r} -> wire dx={dx} dy={dy} active={self._scroll_active}")
         if dx == 0 and dy == 0:
             return
         pointer = build_digitizer_report(
@@ -531,14 +573,6 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             round(float(scroll.get("y", 0.5)) * 65536),
         )
         await self._ensure_hid()
-        if not self._scroll_descriptors_logged:
-            self._scroll_descriptors_logged = True
-            try:
-                services = await self._uhs.list_connected_services()
-                for descriptor in services.get("connectedServices", []):
-                    _scroll_log(f"descriptor {descriptor!r}")
-            except Exception as exc:
-                _scroll_log(f"descriptor query failed: {exc!r}")
         service = DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE
         # 与抓包一致的持续手势：首个增量走 mayBegin+began，后续增量走 changed，
         # 停止 120ms 后发 ended；不发 momentum，滚轮停下即停住。
@@ -550,15 +584,9 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         for index, (chunk_x, chunk_y) in enumerate(_scroll_chunks(dx, dy)):
             reports.append(_scroll_report(chunk_x, chunk_y, 0x02 if index else phase))
         async with self._hid_lock:
-            uhs = self._uhs
-            try:
-                for report in reports:
-                    await uhs.send_report(service, report)
-                    _scroll_log(f"sent svc={service} report={report.hex()}")
-                self._scroll_active = True
-            except Exception as exc:
-                _scroll_log(f"send failed: {exc!r}")
-                raise
+            for report in reports:
+                await self._uhs.send_report(service, report)
+            self._scroll_active = True
         self._schedule_scroll_end()
 
     def _schedule_scroll_end(self) -> None:
@@ -578,9 +606,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                     await self._uhs.send_report(
                         DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE, _scroll_report(0, 0, 0x04)
                     )
-                    _scroll_log("scroll session ended")
-                except Exception as exc:
-                    _scroll_log(f"end failed: {exc!r}")
+                except Exception:
+                    logging.debug("scroll end failed", exc_info=True)
                 finally:
                     self._scroll_active = False
 
@@ -592,30 +619,6 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             self._scroll_end_handle.cancel()
             self._scroll_end_handle = None
         await super()._stop_hid()
-
-    async def _paste_text(self, text: str) -> None:
-        """电脑输入法提交的文本：写手机剪贴板后按 ⌘V 四段和弦粘贴进手机。
-
-        HID 键盘打不出 Unicode，中文等提交文本只能经剪贴板进手机（与 Device Hub / ipb 一致）。
-        整个动作在 /key 的单一 HID 队列里执行：剪贴板写失败就跳过和弦，绝不粘贴旧内容；
-        ⌘V 必须按 ⌘ → ⌘+V → V → 抬起 四段发送，两段式会被 iOS 当成裸 v。
-        """
-        try:
-            await self._ensure_keyboard()
-        except Exception as exc:
-            _scroll_log(f"paste: keyboard service failed: {exc!r}")
-            return
-        try:
-            async with PasteboardService(self._rsd) as service:
-                await asyncio.wait_for(service.set_text(text[:65536]), timeout=2.0)
-        except Exception as exc:
-            _scroll_log(f"paste: clipboard write failed: {exc!r}")
-            return
-        # 等剪贴板变化在系统内生效后再粘贴。
-        await asyncio.sleep(0.05)
-        for step in ([0xE3], [0xE3, 0x19], [0x19], []):
-            await self._uhs.send_keyboard(self._kb_service_id, step)
-            await asyncio.sleep(0.02)
 
     async def _handle_key(self, body: bytes) -> tuple[int, bytes]:
         try:

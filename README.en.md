@@ -15,8 +15,8 @@ Under the hood it supports two decoupled paths:
 
 ## Features
 
-- **A tab in the right sidebar**: add the "手机" tab from the sidebar's "+" and the device screen appears, scaled to fit; switching tabs keeps the session, closing the tab disconnects and releases the device-side process.
-- **Mouse and keyboard control**: clicks, drags and wheel scrolling are sent over the scrcpy control protocol; ASCII characters are injected as key events, non-ASCII text goes through the device clipboard, and the pinyin of a composition is shown under the panel.
+- **A tab in the right sidebar**: add the "手机" tab from the sidebar's "+" and the device screen appears, scaled to fit; collapsing the sidebar or switching to another tab pauses audio/video delivery but keeps the device session, and returning resumes from a live keyframe; switching DSH conversations follows the phone tab when the sidebar is open and shares the same connection; another window covering DSH does not pause it; closing the last phone tab disconnects and releases the device-side session.
+- **Mouse and keyboard control**: clicks, drags and wheel scrolling are sent over the scrcpy control protocol; the keyboard is forwarded key by key like an external one — on iOS the pinyin is composed by the phone's own input method and picked from the PC keyboard with digits, space or enter while the on-screen keyboard stays hidden, and ASCII types straight through; on Android non-ASCII text is injected as key events.
 - **Audio forwarding**: Opus 48 kHz stereo through an AudioWorklet ring buffer, 80 ms startup buffer that grows to 240 ms on underrun; devices without capturable audio fall back to a silent session.
 - **Decoding on a worker thread**: the stream, H.264 decoding, drawing and audio decoding all run in a Worker, so DSH spending the main thread on chat rendering or file writes does not stall the panel; without a Worker it falls back to the main thread.
 - **Automatic fallback**: when scrcpy cannot start, the plugin polls `adb screencap` instead (260 ms per frame by default), which is slow but works on almost any device adb can reach.
@@ -68,7 +68,8 @@ If adb is already installed, point `adbPath` at it instead.
 
 ```text
 click / drag / wheel    operate the device directly
-keyboard                click the screen to capture it; Esc releases focus
+keyboard                iOS: click the screen to take over, then just type — pinyin composes on the phone, digits/space/enter pick candidates, Esc puts the phone keyboard away
+                        Android: click the screen to capture it; Esc releases focus
 fullscreen              the "全屏" toolbar button
 quality                 smooth 720 / standard 1080 / high 1600
 wireless                "转无线" switches USB to TCP and connects automatically
