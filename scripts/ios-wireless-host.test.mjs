@@ -23,6 +23,10 @@ test('learned wireless hosts round-trip and prefer fresh values', () => {
     // 空 host 不写入、不覆盖已有值。
     saveLearnedWirelessHost(udid, '')
     assert.equal(learnedWirelessHost(udid), '10.4.99.2')
+    // 只保留最新一台设备的地址，换设备时旧记录直接作废。
+    saveLearnedWirelessHost('TEST-0000-OTHER', '10.4.7.7')
+    assert.equal(learnedWirelessHost('TEST-0000-OTHER'), '10.4.7.7')
+    assert.equal(learnedWirelessHost(udid), '')
   } finally {
     if (backup === null) {
       rmSync(storePath, { force: true })

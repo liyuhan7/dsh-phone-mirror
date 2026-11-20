@@ -17,6 +17,10 @@ test('runtime candidates prefer the configured python, then the bundled copy', (
     const plain = runtimeCandidates()
     assert.equal(plain[0].source, 'bundled')
     assert.ok(plain[0].python.includes(join('tools', 'ios-runtime', platform)))
+    assert.deepEqual(plain.slice(-2).map((entry) => entry.source), ['local-venv', 'user-venv'])
+    const pythonParts = platform.startsWith('win32') ? ['Scripts', 'python.exe'] : ['bin', 'python']
+    assert.ok(plain.at(-2).python.endsWith(join('.tmp', 'py', ...pythonParts)))
+    assert.ok(plain.at(-1).python.endsWith(join('phone-mirror-ios-venv', ...pythonParts)))
 
     const configuredPath = resolve('/custom/python.exe')
     process.env.DSH_PHONE_MIRROR_IOS_PYTHON = configuredPath

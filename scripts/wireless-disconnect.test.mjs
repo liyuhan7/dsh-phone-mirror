@@ -71,11 +71,12 @@ test('bottom disconnect hides the selected iPhone from both wireless discovery s
   const records = [`${udid}.plist`, `remote_${udid}.plist`, 'remote_other-phone.plist']
   let pairSucceeded = false
   let learnedHost = ''
+  let verified = false
   const createProvider = runInNewContext(`${providerSource.replaceAll('import.meta.url', 'entry')}\ncreateIosProvider`, {
     entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
     existsSync: () => true, readdirSync: () => records,
     runtimeState: { preparing: false, message: '' },
-    pairIosWireless: async (id) => ({ ok: pairSucceeded, address: `wifi:${id}`, wirelessHost: learnedHost }),
+    pairIosWireless: async (id) => ({ ok: pairSucceeded, address: `wifi:${id}`, wirelessHost: learnedHost, directReady: verified }),
     // 在线/离线探测用：测试里没有学到的地址，直接当离线，不去连真实端口。
     learnedWirelessHost: () => '',
     netConnect() {
@@ -104,6 +105,8 @@ test('bottom disconnect hides the selected iPhone from both wireless discovery s
   assert.equal(paired.status, 200)
   assert.equal(paired.body.directReady, false)
   learnedHost = '192.0.2.1'
+  assert.equal((await provider.toWireless(udid)).body.directReady, false)
+  verified = true
   assert.equal((await provider.toWireless(udid)).body.directReady, true)
   assert.deepEqual(await listed(), [udid, serial, 'wifi:other-phone'])
   assert.equal(await provider.canRecoverWireless(serial), true)
@@ -114,15 +117,24 @@ test('manual iOS wireless address overrides the learned address for connection a
   const providerSource = readFileSync(providerEntry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
   const probed = []
   const started = []
+  const saved = []
+  let failStart = false
   let configured = ' 192.0.2.2:49153 '
   const createProvider = runInNewContext(`${providerSource.replaceAll('import.meta.url', 'entry')}\ncreateIosProvider`, {
     entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
     existsSync: () => true, readdirSync: () => ['remote_active-phone.plist'],
     runtimeState: { preparing: false, message: '' },
     learnedWirelessHost: () => '192.0.2.1',
+    saveLearnedWirelessHost: (...args) => saved.push(args),
     IosSession: class {
-      constructor({ host }) { started.push(host) }
-      async start() {}
+      constructor({ host, serial }) {
+        started.push(host)
+        // 与真实会话一致：从 wifi: 序列号推导 udid，供连接成功后落盘地址用。
+        this.udid = serial.startsWith('wifi:') ? serial.slice(5) : serial
+        this.serial = serial
+      }
+      async start() { if (failStart) throw new Error('verification failed') }
+      async stop() {}
     },
     netConnect(options) {
       const socket = new EventEmitter()
@@ -144,6 +156,11 @@ test('manual iOS wireless address overrides the learned address for connection a
   await provider.startSession({ serial })
   assert.deepEqual(started, ['192.0.2.2:49153', '192.0.2.1'])
   assert.deepEqual(probed, [['192.0.2.2', 49153], ['192.0.2.1', 49152]])
+  await provider.startSession({ serial, iosWirelessHost: '192.0.2.3' })
+  assert.deepEqual(saved, [['active-phone', '192.0.2.3']])
+  failStart = true
+  await assert.rejects(provider.startSession({ serial, iosWirelessHost: '192.0.2.4' }), /verification failed/)
+  assert.deepEqual(saved, [['active-phone', '192.0.2.3']])
 })
 
 test('manual iOS IPv4 is validated and retained for wireless recovery', async () => {
@@ -157,6 +174,12 @@ test('manual iOS IPv4 is validated and retained for wireless recovery', async ()
   tick()
   await flush()
   assert.deepEqual(targets.map((target) => target.iosWirelessHost), ['192.0.2.3', '192.0.2.3'])
+})
+
+test('manual iOS address connects unpaired devices via sentinel serial', async () => {
+  const { call, targets } = fixture()
+  await call('/connect', { platform: 'ios', serial: 'wifi:manual', iosWirelessHost: '192.0.2.9' })
+  assert.equal(targets[0].iosWirelessHost, '192.0.2.9')
 })
 
 test('disconnect stops the named wireless session but preserves pairing and USB', async () => {
