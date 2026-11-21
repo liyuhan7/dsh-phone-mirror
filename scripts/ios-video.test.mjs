@@ -91,3 +91,134 @@ test('iOS resync starts at a live keyframe and never replays cached video', { ti
   }
   assert.ok(decoded.every((f) => f.closed === 1))
 })
+
+test('rotation packets update geometry instead of reaching the decoder', { timeout: 4000 }, async () => {
+  const decoded = []
+  const geometry = []
+  const streams = { host: null, direct: null }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      const key = String(url).endsWith('/stream.bin') ? 'direct' : 'host'
+      return new Response(new ReadableStream({ start(c) { streams[key] = c } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {}, save() {}, restore() {}, translate() {}, rotate() {}, fillRect() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        decoded.push(chunk.data[0])
+        this.output({ displayWidth: 1290, displayHeight: 2796, closed: 0, close() {} })
+      }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas: {
+      width: 100, height: 200,
+      getContext: (() => {
+        const ctx = { drawImage() {}, setTransform() {}, save() {}, restore() {}, translate() {}, rotate() {}, fillRect() {} }
+        return () => ctx
+      })()
+    },
+    post: (message) => { if (message.type === 'geometry') geometry.push(message) }
+  })
+  const packet = (type, body) => {
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(body.length + 1)
+    return Buffer.concat([prefix, Buffer.of(type), body])
+  }
+  engine.handle({ type: 'open', streamUrl: '/video', directVideoUrl: 'http://127.0.0.1:49152/stream.bin' })
+  try {
+    for (let i = 0; i < 20 && (!streams.host || !streams.direct); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1290, height: 2796 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))))
+    streams.direct.enqueue(Buffer.concat([
+      packet(2, Buffer.of(1)),
+      packet(4, Buffer.from(JSON.stringify({ rotation: 90 }))),
+      packet(1, Buffer.of(2))
+    ]))
+    for (let i = 0; i < 80 && geometry.length < 1; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    // 朝向包不进解码器，只更新几何。
+    assert.deepEqual(decoded, [1, 2])
+    assert.ok(geometry.some((g) => g.rotation === 90 && g.width === 2796 && g.height === 1290), JSON.stringify(geometry))
+    // 宿主 meta 里的旧朝向不得覆盖流内朝向（重连后 meta 会带初始值 0）。
+    const before = geometry.length
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', rotation: 0, screen: { width: 1290, height: 2796 }
+    }))))
+    for (let i = 0; i < 20; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(geometry.length, before, JSON.stringify(geometry))
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+// 直连视频瞬断时提示一次故障，恢复后（首个数据块到达）主动清掉提示，
+// 不等下一条控制指令成功才清。
+test('direct video fault note clears on recovery', { timeout: 6000 }, async () => {
+  const notes = []
+  let hostStream = null
+  let directAttempts = 0
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      if (!String(url).endsWith('/stream.bin')) {
+        return new Response(new ReadableStream({ start(c) { hostStream = c } }))
+      }
+      directAttempts += 1
+      if (directAttempts === 1) throw new TypeError('network error')
+      const prefix = Buffer.alloc(4)
+      prefix.writeUInt32BE(2)
+      const chunk = Buffer.concat([prefix, Buffer.of(2, 1)])
+      return new Response(new ReadableStream({ start(c) { c.enqueue(chunk) } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {}, fillRect() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode() {}
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas: { width: 100, height: 200, getContext: () => ({
+      drawImage() {}, setTransform() {}, fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}
+    }) },
+    post: (message) => { if (message.type === 'note') notes.push(message.message) }
+  })
+  engine.handle({ type: 'open', streamUrl: '/video', directVideoUrl: 'http://127.0.0.1:49152/stream.bin' })
+  try {
+    for (let i = 0; i < 200 && !(notes.length >= 2 && notes[1] === ''); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(directAttempts, 2)
+    assert.ok(notes[0]?.startsWith('视频直连失败'), JSON.stringify(notes))
+    assert.equal(notes[1], '', JSON.stringify(notes))
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})

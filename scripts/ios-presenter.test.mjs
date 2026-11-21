@@ -285,3 +285,42 @@ test('canvas backing follows the panel size while geometry stays in device pixel
     engine.handle({ type: 'close' })
   }
 })
+
+// 重开会话清屏时必须先复位变换矩阵：遗留的 renderScale 缩放会把黑底
+// 画成左上角一小块，看起来像画面上叠了个黑色矩形。
+test('reopening resets the transform before clearing the canvas', async () => {
+  const calls = []
+  const canvas = { width: 640, height: 360, getContext: () => ({
+    fillRect: (x, y, w, h) => calls.push(['fillRect', x, y, w, h]),
+    setTransform: (...args) => calls.push(['setTransform', ...args]),
+    save() {}, restore() {}, translate() {}, rotate() {}, drawImage() {}
+  }) }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async () => new Response(new ReadableStream({ start() {} })),
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor() {}
+      configure() { this.state = 'configured' }
+      decode() {}
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({ canvas, post() {} })
+  calls.length = 0
+  engine.handle({ type: 'open', streamUrl: '/video' })
+  await new Promise((resolve) => setImmediate(resolve))
+  const open = calls.findIndex((call) => call[0] === 'setTransform' && call[1] === 1 && call[5] === 0)
+  assert.ok(open >= 0, JSON.stringify(calls))
+  const fill = calls[open + 1]
+  assert.equal(fill[0], 'fillRect')
+  assert.equal(fill[3], 640)
+  assert.equal(fill[4], 360)
+  engine.handle({ type: 'close' })
+})
