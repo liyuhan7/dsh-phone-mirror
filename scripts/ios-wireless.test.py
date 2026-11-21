@@ -384,39 +384,55 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(refused)
         self.assertIn(b"403", refused)
 
-    async def test_idle_input_pings_dead_hid_link_and_rebuilds(self):
+    async def test_input_kick_verifies_hid_link_in_background(self):
         from types import MethodType
 
         def server(**fields):
             holder = SimpleNamespace(
                 _indigo=None, _touch_service_id=257, _scroll_active=False,
-                _hid_ok_at=0.0, _hid_lock=asyncio.Lock(), **fields,
+                _hid_ok_at=0.0, _hid_check=None, _hid_lock=asyncio.Lock(), **fields,
             )
-            holder._hid_alive = MethodType(bridge.MirrorScreenStreamServer._hid_alive, holder)
+            holder._hid_verify = MethodType(bridge.MirrorScreenStreamServer._hid_verify, holder)
             holder._reset_hid = MethodType(bridge.MirrorScreenStreamServer._reset_hid, holder)
             return holder
 
         async def dead_ping():
             raise asyncio.TimeoutError()
 
+        # 死链：探活失败后丢弃，交回 _ensure_hid 现场重建。
         holder = server(_uhs=SimpleNamespace(
             list_connected_services=AsyncMock(side_effect=dead_ping), close=AsyncMock(),
         ))
-        await bridge.MirrorScreenStreamServer._ensure_hid_ready(holder)
-        # 探活失败后死链被丢弃，交回 _ensure_hid 现场重建。
+        await bridge.MirrorScreenStreamServer._hid_verify(holder)
         self.assertIsNone(holder._uhs)
-        holder._uhs is None or None
 
-        # 链路健康时不做任何重建。
+        # 健康链路不做重建。
         healthy = server(_uhs=SimpleNamespace(list_connected_services=AsyncMock(return_value={})))
-        await bridge.MirrorScreenStreamServer._ensure_hid_ready(healthy)
+        await bridge.MirrorScreenStreamServer._hid_verify(healthy)
         self.assertIsNotNone(healthy._uhs)
 
-        # 探活结果 1.5 秒内复用，连发的连续输入不会每次都 ping。
+        # 2 秒内复用探活结果，连续输入不会每次都探。
         again = server(_uhs=SimpleNamespace(list_connected_services=AsyncMock(return_value={})))
         again._hid_ok_at = asyncio.get_running_loop().time()
-        await bridge.MirrorScreenStreamServer._ensure_hid_ready(again)
+        bridge.MirrorScreenStreamServer._hid_kick(again)
+        self.assertIsNone(again._hid_check)
         again._uhs.list_connected_services.assert_not_awaited()
+
+    async def test_touch_and_scroll_entry_points_resolve_all_methods(self):
+        """输入入口引用的方法必须真实存在：曾把 _ensure_hid_ready 误删，
+        每条触摸/滚轮指令在 worker 里 AttributeError、HTTP 永不响应，
+        表现为点击与滚轮全部失效。"""
+        import inspect
+        import re
+
+        cls = bridge.MirrorScreenStreamServer
+        for entry in (cls._handle_touch, cls._send_scroll):
+            source = inspect.getsource(entry)
+            for name in re.findall(r"self\.(_\w+)\(", source):
+                resolved = hasattr(cls, name) or hasattr(bridge.ScreenStreamServer, name)
+                self.assertTrue(
+                    resolved, f"{entry.__name__} 引用了不存在的方法 self.{name}()"
+                )
 
     async def test_verify_wireless_address_requires_rsd_and_closes_it(self):
         rsd = SimpleNamespace(close=AsyncMock())

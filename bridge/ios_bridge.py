@@ -797,6 +797,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
     _motion_task = None
     # 上次确认 HID 链路健康的时刻（loop.time）；0 表示尚未探过。
     _hid_ok_at = 0.0
+    # 后台探活任务：同一时间只跑一个。
+    _hid_check = None
 
     async def _hid_alive(self) -> bool:
         """一次真实 RPC 探活：HID 发送本身不等响应，死链必须靠请求-响应探出来。"""
@@ -824,6 +826,34 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             logging.warning("hid link dead (ping failed), rebuilding")
             async with self._hid_lock:
                 await self._reset_hid()
+
+    def _hid_kick(self) -> None:
+        """输入发出后顺手探活，链路死掉时在下一次输入前完成重建。
+
+        send_report 是发射后不管：写进断掉的连接不抛错，只静默丢报告，
+        表现就是「画面正常但点击无效」。只有 list_connected_services 这种
+        等响应的调用能探出死链。探活放在发送之后，避免给正常输入加延迟。
+        """
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._hid_ok_at < 2.0:
+            return
+        self._hid_ok_at = loop.time()
+        if self._hid_check is not None and not self._hid_check.done():
+            return
+        self._hid_check = asyncio.create_task(self._hid_verify())
+
+    async def _hid_verify(self) -> None:
+        uhs = self._uhs
+        if uhs is None:
+            return
+        try:
+            await asyncio.wait_for(uhs.list_connected_services(), 1.0)
+            return
+        except Exception:
+            pass
+        logging.warning("hid link dead (ping failed), rebuilding")
+        async with self._hid_lock:
+            await self._reset_hid()
 
     def _refuse_request(self, headers):
         """桌面端页面与 sidecar 同机不同端口，跨源读取会被上游的同源检查拦下。
@@ -913,12 +943,17 @@ class MirrorScreenStreamServer(ScreenStreamServer):
     async def _handle_touch(self, body: bytes) -> tuple[int, bytes]:
         await self._ensure_hid_ready()
         try:
-            return await super()._handle_touch(body)
+            result = await super()._handle_touch(body)
         except Exception:
             logging.info("touch send failed, rebuilding HID link", exc_info=True)
             async with self._hid_lock:
                 await self._reset_hid()
-            return await super()._handle_touch(body)
+            result = await super()._handle_touch(body)
+        # send_report 是发射后不管：链路断了不抛错，报告被静默丢掉，
+        # 表现为「画面正常但点击无效」。发送后顺手探活，死链在下一次
+        # 输入到达前就被后台重建。
+        self._hid_kick()
+        return result
 
     async def _send_scroll(self, scroll: dict[str, Any]) -> None:
         # 客户端 dy 为「向上为正」（scrcpy 习惯），设备 HID 增量方向与之相反，
@@ -954,6 +989,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             async with self._hid_lock:
                 await self._reset_hid()
             raise
+        # 与触摸同理：滚轮报告同样可能被静默丢弃，发送后探活。
+        self._hid_kick()
         self._schedule_scroll_end()
 
     def _schedule_scroll_end(self) -> None:
