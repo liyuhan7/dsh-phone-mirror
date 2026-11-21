@@ -24,6 +24,7 @@ import os
 import plistlib
 import shutil
 import socket
+import urllib.parse
 import struct
 import sys
 import tempfile
@@ -762,6 +763,29 @@ def _scroll_report(dx: int, dy: int, phase: int, momentum: int = 0) -> bytes:
     )
 
 
+class _CorsWriter:
+    """代理 StreamWriter：在首个 HTTP 响应头里补 CORS，允许浏览器引擎
+    Worker 跨端口直读本进程的流响应；其余调用原样转发。"""
+
+    __slots__ = ("_inner", "_head_done")
+
+    def __init__(self, inner: asyncio.StreamWriter) -> None:
+        self._inner = inner
+        self._head_done = False
+
+    def write(self, data: bytes) -> None:
+        if not self._head_done:
+            self._head_done = True
+            if data[:8] == b"HTTP/1.1":
+                head, sep, rest = data.partition(b"\r\n\r\n")
+                if sep:
+                    return self._inner.write(head + b"\r\nAccess-Control-Allow-Origin: *" + sep + rest)
+        return self._inner.write(data)
+
+    def __getattr__(self, name: str):
+        return getattr(self._inner, name)
+
+
 class MirrorScreenStreamServer(ScreenStreamServer):
     _scroll_active = False
     _scroll_end_handle = None
@@ -800,6 +824,26 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             logging.warning("hid link dead (ping failed), rebuilding")
             async with self._hid_lock:
                 await self._reset_hid()
+
+    def _refuse_request(self, headers):
+        """桌面端页面与 sidecar 同机不同端口，跨源读取会被上游的同源检查拦下。
+
+        上游规则只放行 Origin 与 Host 完全相同的请求（防 DNS rebinding）。
+        这里额外放行回环来源，让 DSH 页面能直连视频流；其余来源、以及设置
+        密码时的凭据校验，全部沿用上游行为。
+        """
+        origin = headers.get("origin")
+        if origin not in (None, "null"):
+            try:
+                host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+            except ValueError:
+                host = ""
+            if host in ("127.0.0.1", "localhost", "::1"):
+                return super()._refuse_request({**headers, "origin": None})
+        return super()._refuse_request(headers)
+
+    async def _handle_http(self, reader, writer) -> None:
+        await super()._handle_http(reader, _CorsWriter(writer))
 
     async def _ensure_keyboard(self) -> None:
         """在独立连接上注册宿主虚拟键盘。

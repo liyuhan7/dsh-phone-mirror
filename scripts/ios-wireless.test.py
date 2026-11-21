@@ -373,6 +373,17 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertIsNone(await bridge._discover_wireless_address("phone"))
 
+    async def test_loopback_origin_allowed_but_foreign_origin_refused(self):
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._password = None
+        # DSH 页面与 sidecar 同机不同端口：浏览器会带自己的 Origin。
+        for origin in ("http://127.0.0.1:43120", "http://localhost:43120"):
+            self.assertIsNone(server._refuse_request({"origin": origin, "host": "127.0.0.1:49152"}))
+        # 其它来源仍按上游的防 DNS rebinding 规则拒绝。
+        refused = server._refuse_request({"origin": "http://evil.example.com", "host": "127.0.0.1:49152"})
+        self.assertIsNotNone(refused)
+        self.assertIn(b"403", refused)
+
     async def test_idle_input_pings_dead_hid_link_and_rebuilds(self):
         from types import MethodType
 
