@@ -65,7 +65,7 @@ dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 1. 打开手机「设置 → 隐私与安全性 → 开发者模式」，按提示重启确认
 2. 用数据线连接电脑并解锁手机，弹窗点「信任」并输入锁屏密码
 3. 右侧栏点「+」添加「手机」页签，顶部平台切到「iOS」，选中 `iPhone` 点「连接」
-4. 无线投屏：保持 USB 连接点「转无线」，等提示无线地址已验证后再拔线，选中 `iPhone (Wi-Fi)` 点「连接」。已配对的设备也可以点「手填地址」，输入手机当前的 IPv4 地址试连。
+4. 无线投屏：保持 USB 连接点「转无线」，等提示无线地址已验证后再拔线，选中 `iPhone (Wi-Fi)` 点「连接」。也可以点「手填地址」输入手机当前的 IPv4 直连；未配对过的设备会在手机上弹「信任」，确认后自动完成配对。手机开个人热点时电脑连上该热点即可，插件会自动学到热点地址。
 
 连接前提、键盘输入、工具栏按钮与故障排查见 [docs/ios.md](docs/ios.md)。
 
@@ -138,7 +138,7 @@ desktop profile 由 Electron 应用独占托管。直接编辑该 profile 的 `p
 
 **iPhone 无线连不上，提示没有收到 RemotePairing 广播**
 
-校园网/企业 AP 常屏蔽客户端之间的组播，而 iOS 的无线发现（以及 Apple Devices 的 Network 发现）都靠 mDNS。插件在 USB 连接期间自动抓包学习手机当前的 Wi-Fi 地址并用 TCP 验证，之后无线连接按学到的地址直连。手机 IP 变化后，可手填 `iosWirelessHost` 覆盖旧地址；也可留空，插回 USB 连一次以刷新自动学习的地址。更多排查见 [docs/ios.md](docs/ios.md)。
+校园网/企业 AP 常屏蔽客户端之间的组播，而 iOS 的无线发现（以及 Apple Devices 的 Network 发现）都靠 mDNS。插件在 USB 连接期间抓取手机自身出站流量学习它的 Wi-Fi 地址，抓不到时再按配对记录匹配 mDNS 广播兜底；无线连接按学到的地址直连。手机 IP 变化后，可手填 `iosWirelessHost` 覆盖旧地址；也可留空，插回 USB 连一次以刷新自动学习的地址。更多排查见 [docs/ios.md](docs/ios.md)。
 
 **画面发黑，或帧率只有个位数**
 

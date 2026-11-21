@@ -65,7 +65,7 @@ On native Android 11+ you can also use "配对" with the pairing address and 6-d
 1. Turn on "设置 → 隐私与安全性 → 开发者模式", then reboot and confirm
 2. Connect the cable, unlock the phone, and trust the computer with the passcode
 3. Add the "手机" tab, switch the platform to "iOS", select `iPhone` and press "连接"; the first connection prepares the Python dependencies and mounts the Developer Disk Image, so keep the phone unlocked
-4. For wireless: keep the USB cable connected and press "转无线". Wait for the wireless address to be verified before unplugging, then select `iPhone (Wi-Fi)` and press "连接". For a paired device, use "手填地址" to connect using the phone’s current IPv4 address.
+4. For wireless: keep the USB cable connected and press "转无线". Wait for the wireless address to be verified before unplugging, then select `iPhone (Wi-Fi)` and press "连接". You can also press "手填地址" and dial the phone's current IPv4 directly; a device that was never paired shows a Trust prompt on the phone and pairs itself once confirmed. With a personal hotspot, just join the hotspot from the computer — the plugin learns the hotspot address on its own.
 
 Prerequisites, keyboard input, toolbar actions and troubleshooting are documented in [docs/ios.md](docs/ios.md) (Chinese).
 
@@ -138,7 +138,7 @@ Check the speaker button first. On Android, grey means the session never got aud
 
 **iPhone wireless connect fails with "no RemotePairing broadcast"**
 
-Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's current Wi-Fi address while it is connected over USB (packet capture, verified over TCP) and dials that address directly. When the phone’s IP changes, set `iosWirelessHost` to override the old address, or leave it empty and connect over USB once to refresh the learned address. See [docs/ios.md](docs/ios.md) for more.
+Campus and enterprise APs often block multicast between clients, and iOS wireless discovery — plus the Apple Devices Network path — is mDNS, so both go deaf. The plugin learns the phone's Wi-Fi address from its own outbound traffic while it is connected over USB, falling back to an mDNS match against the pairing record when nothing is captured; wireless connections dial the learned address directly. When the phone’s IP changes, set `iosWirelessHost` to override the old address, or leave it empty and connect over USB once to refresh the learned address. See [docs/ios.md](docs/ios.md) for more.
 
 **Black picture, or a single-digit frame rate**
 

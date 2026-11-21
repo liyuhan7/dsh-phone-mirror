@@ -168,8 +168,12 @@ test('direct sidecar stream bypasses the host relay', async () => {
     requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
     fetch: async (url) => {
       fetchedUrls.push(url)
-      const target = String(url).endsWith('/stream.bin') ? sidecarController : hostController
-      return new Response(new ReadableStream({ start(c) { if (target) c.enqueue(target.pending.shift()) } }))
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      }
+      const holder = target.endsWith('/stream.bin') ? sidecarController : hostController
+      return new Response(new ReadableStream({ start(c) { if (holder) c.enqueue(holder.pending.shift()) } }))
     },
     OffscreenCanvas: class {
       constructor(width, height) { Object.assign(this, { width, height }) }
@@ -223,7 +227,11 @@ test('direct sidecar stream bypasses the host relay', async () => {
   })
   try {
     await drain()
-    assert.deepEqual(fetchedUrls.sort(), ['/video', 'http://127.0.0.1:49152/stream.bin'])
+    assert.deepEqual(fetchedUrls.sort(), [
+      '/video',
+      'http://127.0.0.1:49152/codec',
+      'http://127.0.0.1:49152/stream.bin'
+    ])
     // 增量前的 200 与配置帧被丢弃，解码顺序为缓存关键帧起的三帧。
     assert.deepEqual(decoded.map((f) => f.id), [101, 102, 103, 104])
     assert.equal(blits.length, 4)

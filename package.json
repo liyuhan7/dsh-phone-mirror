@@ -1,6 +1,6 @@
 {
   "name": "dsh-phone-mirror",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "用 agent 干活时把安卓设备与 iPhone 投到 DSH 右侧栏并反控，刷视频、回消息不用拿手机：scrcpy + WebCodecs + CoreDevice",
   "type": "module",
   "license": "MIT",
@@ -39,6 +39,7 @@
   "files": [
     "lib",
     "bridge",
+    "!bridge/__pycache__",
     "tools/scrcpy-server.jar",
     "scripts/build-client.mjs",
     "scripts/fetch-tools.mjs",

@@ -830,9 +830,7 @@ class MirrorScreenStreamServer(ScreenStreamServer):
     def _hid_kick(self) -> None:
         """输入发出后顺手探活，链路死掉时在下一次输入前完成重建。
 
-        send_report 是发射后不管：写进断掉的连接不抛错，只静默丢报告，
-        表现就是「画面正常但点击无效」。只有 list_connected_services 这种
-        等响应的调用能探出死链。探活放在发送之后，避免给正常输入加延迟。
+        探活放在发送之后，不给正常输入加延迟。
         """
         loop = asyncio.get_running_loop()
         if loop.time() - self._hid_ok_at < 2.0:
@@ -949,9 +947,7 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             async with self._hid_lock:
                 await self._reset_hid()
             result = await super()._handle_touch(body)
-        # send_report 是发射后不管：链路断了不抛错，报告被静默丢掉，
-        # 表现为「画面正常但点击无效」。发送后顺手探活，死链在下一次
-        # 输入到达前就被后台重建。
+        # 发送后探活：死链在下一次输入到达前完成重建。
         self._hid_kick()
         return result
 
@@ -989,7 +985,6 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             async with self._hid_lock:
                 await self._reset_hid()
             raise
-        # 与触摸同理：滚轮报告同样可能被静默丢弃，发送后探活。
         self._hid_kick()
         self._schedule_scroll_end()
 

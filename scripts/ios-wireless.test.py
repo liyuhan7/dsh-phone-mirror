@@ -419,9 +419,8 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         again._uhs.list_connected_services.assert_not_awaited()
 
     async def test_touch_and_scroll_entry_points_resolve_all_methods(self):
-        """输入入口引用的方法必须真实存在：曾把 _ensure_hid_ready 误删，
-        每条触摸/滚轮指令在 worker 里 AttributeError、HTTP 永不响应，
-        表现为点击与滚轮全部失效。"""
+        """触摸与滚轮入口引用的 self.* 方法都必须能在类或父类上解析：
+        入口抛 AttributeError 时 worker 只记日志、不回 HTTP 响应。"""
         import inspect
         import re
 

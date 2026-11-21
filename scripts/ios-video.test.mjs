@@ -27,6 +27,9 @@ test('iOS resync starts at a live keyframe and never replays cached video', { ti
       const target = String(url)
       fetchedUrls.push(target)
       if (options?.method === 'POST') return new Response(new Uint8Array())
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      }
       const controller = target.endsWith('/stream.bin') ? sidecarController : hostController
       return new Response(new ReadableStream({ start(c) { c.enqueue(controller.pending.shift()) } }))
     },
@@ -101,7 +104,11 @@ test('rotation packets update geometry instead of reaching the decoder', { timeo
     setInterval() { return 1 }, clearInterval() {},
     requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
     fetch: async (url) => {
-      const key = String(url).endsWith('/stream.bin') ? 'direct' : 'host'
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1290, height: 2796, rotation: 0 } }))
+      }
+      const key = target.endsWith('/stream.bin') ? 'direct' : 'host'
       return new Response(new ReadableStream({ start(c) { streams[key] = c } }))
     },
     OffscreenCanvas: class {
@@ -181,7 +188,9 @@ test('direct video fault note clears on recovery', { timeout: 6000 }, async () =
     setInterval() { return 1 }, clearInterval() {},
     requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
     fetch: async (url) => {
-      if (!String(url).endsWith('/stream.bin')) {
+      const target = String(url)
+      if (target.endsWith('/codec')) return new Response('{}')
+      if (!target.endsWith('/stream.bin')) {
         return new Response(new ReadableStream({ start(c) { hostStream = c } }))
       }
       directAttempts += 1
@@ -218,6 +227,74 @@ test('direct video fault note clears on recovery', { timeout: 6000 }, async () =
     assert.equal(directAttempts, 2)
     assert.ok(notes[0]?.startsWith('视频直连失败'), JSON.stringify(notes))
     assert.equal(notes[1], '', JSON.stringify(notes))
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+// 引擎重开（切标签页、断开重连）后 rotation 被清零，宿主 meta 只有启动
+// 快照、流内朝向包只在变化时广播——/codec 的当前朝向是唯一可靠种子。
+test('engine reopen seeds the current rotation from /codec', { timeout: 4000 }, async () => {
+  const geometry = []
+  const streams = { host: null, direct: null }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        // 手机此刻已是横屏：/codec 报告当前朝向 90。
+        return new Response(JSON.stringify({
+          codec: 'hvc1.test', display: { width: 1290, height: 2796, rotation: 90 }
+        }))
+      }
+      const key = target.endsWith('/stream.bin') ? 'direct' : 'host'
+      return new Response(new ReadableStream({ start(c) { streams[key] = c } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode() { this.output({ displayWidth: 1290, displayHeight: 2796, closed: 0, close() {} }) }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas: { width: 100, height: 200, getContext: () => ({
+      drawImage() {}, setTransform() {}, fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}
+    }) },
+    post: (message) => { if (message.type === 'geometry') geometry.push(message) }
+  })
+  const packet = (type, body) => {
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(body.length + 1)
+    return Buffer.concat([prefix, Buffer.of(type), body])
+  }
+  engine.handle({ type: 'open', streamUrl: '/video', directVideoUrl: 'http://127.0.0.1:49152/stream.bin' })
+  try {
+    for (let i = 0; i < 20 && (!streams.host || !streams.direct); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    // 宿主 meta 只带启动快照（rotation 0）。
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', rotation: 0, screen: { width: 1290, height: 2796 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))))
+    // 直连流只给关键帧，没有任何 type=4 朝向包。
+    streams.direct.enqueue(packet(2, Buffer.of(1)))
+    for (let i = 0; i < 80 && geometry.length < 1; i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.ok(
+      geometry.some((g) => g.rotation === 90 && g.width === 2796 && g.height === 1290),
+      JSON.stringify(geometry)
+    )
   } finally {
     engine.handle({ type: 'close' })
   }
