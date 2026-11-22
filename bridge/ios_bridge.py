@@ -99,6 +99,7 @@ from pymobiledevice3.exceptions import (  # noqa: E402
     InvalidServiceError,
     MuxException,
     NotPairedError,
+    PairingError,
     PasswordRequiredError,
     RemotePairingCompletedError,
     UserspaceTunnelUnavailableError,
@@ -291,17 +292,8 @@ _TUNNEL_WINDOW = 20.0
 _BROWSE_WINDOW = 4.0
 # RemotePairing 端口固定，禁组播的网络可以直接按 IP 连。
 _REMOTE_PAIRING_PORT = 49152
-# 手填地址直连未知设备时占位的哨兵 UDID；配对完成后换成真实 UDID。
+# 手填地址而未选设备时，先用哨兵占位，再从握手和 RSD 获取设备身份。
 MANUAL_UDID = "manual"
-
-
-def _adopt_manual_record(real_udid: str) -> None:
-    """把配对落在哨兵名下的记录换成真实 UDID，后续连接才能按 UDID 找到它。"""
-    source = _PMD_HOME / f"remote_{MANUAL_UDID}.plist"
-    if not source.is_file() or not real_udid or real_udid == MANUAL_UDID:
-        return
-    with contextlib.suppress(Exception):
-        source.replace(_PMD_HOME / f"remote_{real_udid}.plist")
 
 
 def _pinned_endpoints(address: str) -> list[tuple[str, int]]:
@@ -316,23 +308,42 @@ def _pinned_endpoints(address: str) -> list[tuple[str, int]]:
 
 
 
-async def _attempt_remote_endpoint(udid: str, host: str, port: int, timeout: float, autopair: bool = False):
+async def _attempt_remote_endpoint(
+    udid: str, host: str, port: int, timeout: float, autopair: bool = False, *, adopt_record: bool = False,
+):
     """连一个 RemotePairing 地址并建 RSD 隧道；失败抛出带阶段信息的 OSError。
 
     ``autopair`` 用于尚未配对的新设备：由设备弹窗确认后建立配对记录。
     """
     stage = "TCP 建连"
+    service_type = (tunnel_service.RemotePairingManualPairingService if autopair
+                    else tunnel_service.RemotePairingTunnelService)
 
-    class StagedService(tunnel_service.RemotePairingTunnelService):
+    class StagedService(service_type):
         async def _attempt_pair_verify(self):
             nonlocal stage
             stage = "RemotePairing 初始握手"
-            return await super()._attempt_pair_verify()
+            await super()._attempt_pair_verify()
+            if autopair:
+                peer_id = self.handshake_info.get("peerDeviceInfo", {}).get("identifier")
+                if peer_id and udid == MANUAL_UDID:
+                    self._remote_identifier = peer_id
 
         async def _validate_pairing(self):
             nonlocal stage
             stage = "RemotePairing 配对验证"
             return await super()._validate_pairing()
+
+        async def _pair(self):
+            nonlocal stage
+            stage = "RemotePairing 请求信任"
+            if (self.handshake_info.get("deviceOptions", {}).get("allowsPairSetup") is False
+                    or self.remote_identifier == MANUAL_UDID):
+                raise NotPairedError("该设备不支持通过此地址首次配对，请插 USB 后点「转无线」")
+            peer_id = self.handshake_info.get("peerDeviceInfo", {}).get("identifier")
+            if udid != MANUAL_UDID and peer_id and peer_id != udid:
+                raise NotPairedError("填写的 IP 不属于所选 iPhone")
+            return await super()._pair()
 
     service: Any = None
 
@@ -340,12 +351,16 @@ async def _attempt_remote_endpoint(udid: str, host: str, port: int, timeout: flo
         nonlocal stage
         candidate = StagedService(udid, host, port, connect_timeout=6.0)
         try:
-            await candidate.connect(autopair=autopair)
-        except RemotePairingCompletedError:
-            # 设备确认信任后配对完成会断开这条连接，按新记录重连一次。
-            await candidate.close()
-            candidate = StagedService(udid, host, port, connect_timeout=6.0)
-            await candidate.connect(autopair=False)
+            try:
+                await candidate.connect(autopair=autopair)
+            except RemotePairingCompletedError:
+                # 设备确认信任后会断开这条连接，按新记录重连一次。
+                await candidate.close()
+                stage = "TCP 建连"
+                candidate = StagedService(udid, host, port, connect_timeout=6.0)
+                await candidate.connect(autopair=False)
+            if autopair and not hasattr(candidate, "client_cip"):
+                raise NotPairedError("无线配对未通过验证")
         except BaseException:
             with contextlib.suppress(Exception):
                 await candidate.close()
@@ -361,8 +376,15 @@ async def _attempt_remote_endpoint(udid: str, host: str, port: int, timeout: flo
     tunnel = userspace_tunnel.UserspaceRsdTunnel(provider_factory=remote_provider)
     try:
         async with asyncio.timeout(timeout):
-            return await tunnel.aopen(), tunnel
-    except (OSError, ConnectionTerminatedError, asyncio.IncompleteReadError) as exc:
+            rsd = await tunnel.aopen()
+            if autopair and udid != MANUAL_UDID and rsd.udid != udid:
+                raise NotPairedError("填写的 IP 不属于所选 iPhone")
+            if (adopt_record or udid == MANUAL_UDID) and rsd.udid != service.remote_identifier:
+                # 握手标识可能不同于设备列表和后续重连使用的真实 UDID。
+                name = pmd_pair_records.get_remote_pairing_record_filename(rsd.udid)
+                service.pair_record_path.replace(_PMD_HOME / f"{name}.plist")
+            return rsd, tunnel
+    except (OSError, ConnectionTerminatedError, asyncio.IncompleteReadError, NotPairedError, PairingError) as exc:
         with contextlib.suppress(Exception):
             await tunnel.aclose()
         if service is not None:
@@ -378,16 +400,15 @@ async def _attempt_remote_endpoint(udid: str, host: str, port: int, timeout: flo
         raise
 
 
-async def _open_remote_tunnel(udid: str, pinned_address: str = ""):
-    record = pmd_pair_records.get_local_pairing_record(
+async def _open_remote_tunnel(udid: str, pinned_address: str = "", *, explicit_host: bool = False):
+    record = None if udid == MANUAL_UDID else pmd_pair_records.get_local_pairing_record(
         pmd_pair_records.get_remote_pairing_record_filename(udid), _PMD_HOME
     )
     irk = (record or {}).get(tunnel_service.PEER_ALT_IRK_KEY)
-    # 手填地址允许直连尚未配对的设备：配对校验失败时由手机弹窗确认后补建记录。
-    can_pair = bool(pinned_address)
-    if not record and not can_pair:
+    can_pair = explicit_host and bool(pinned_address)
+    if not record and not pinned_address:
         raise UserspaceTunnelUnavailableError("无可用的无线配对记录，请插线后点「转无线」")
-    can_browse = isinstance(irk, bytes) and len(irk) == 16
+    can_browse = not explicit_host and isinstance(irk, bytes) and len(irk) == 16
     if not can_browse and not pinned_address:
         raise UserspaceTunnelUnavailableError("无线记录缺少发现密钥，请手填地址或通过 USB 重新配对")
 
@@ -405,10 +426,26 @@ async def _open_remote_tunnel(udid: str, pinned_address: str = ""):
             if remaining <= 0:
                 break
             attempted.append(f"{host}:{port}")
+            if can_pair and udid == MANUAL_UDID:
+                # iPhone 的握手不一定带设备号，只在填写的地址验证本地配对记录。
+                for candidate in pmd_pair_records.iter_remote_paired_identifiers():
+                    if candidate == MANUAL_UDID:
+                        continue
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    try:
+                        return await _attempt_remote_endpoint(
+                            candidate, host, port, min(6.0, remaining), adopt_record=True,
+                        )
+                    except OSError as exc:
+                        if str(exc).startswith("TCP 建连失败"):
+                            failures[f"{host}:{port}"] = str(exc)
+                            break
+                if f"{host}:{port}" in failures:
+                    continue
             # 首次无线配对要等用户在手机上点「信任」，给足等待时间。
-            budget = 90.0 if (can_pair and not record) else min(6.0, remaining)
-            if can_pair and not record:
-                _emit({"type": "stage", "message": f"正在向 {host} 发起配对，请在手机上解锁并点「信任」…"})
+            budget = 45.0 if can_pair else min(6.0, remaining)
             try:
                 return await _attempt_remote_endpoint(
                     udid, host, port, budget, autopair=can_pair,
@@ -458,14 +495,20 @@ async def _open_remote_tunnel(udid: str, pinned_address: str = ""):
             udid,
             f"收到 {answers} 条无线广播但没有一条对得上本机配对记录：插线后点一次「转无线」重建配对",
         )
-    advice = "；若手机 IP 变了，插回 USB 连一次（或点「转无线」）即可自动更新" if pinned_address else ""
+    advice = (
+        "；请核对填写的 IP 地址，未配对时可通过 USB 点「转无线」"
+        if explicit_host else
+        "；若手机 IP 变了，插回 USB 连一次（或点「转无线」）即可自动更新" if pinned_address else ""
+    )
     raise OSError(
         f"{'；'.join(list(failures.values())[:4]) or 'RemotePairing 连接超时'}"
         f"（{len(attempted)} 个地址均失败：{'、'.join(attempted[:4])}{advice}）"
     )
 
 
-async def _open_rsd(udid: str, wireless: bool, pinned_address: str = "") -> tuple[RemoteServiceDiscoveryService, Any, str]:
+async def _open_rsd(
+    udid: str, wireless: bool, pinned_address: str = "", *, explicit_host: bool = False,
+) -> tuple[RemoteServiceDiscoveryService, Any, str]:
     """Open a userspace RSD tunnel over USB or RemotePairing Wi-Fi."""
     if not wireless:
         try:
@@ -495,9 +538,11 @@ async def _open_rsd(udid: str, wireless: bool, pinned_address: str = "") -> tupl
         return rsd, tunnel, device_name
 
     try:
-        rsd, tunnel = await _open_remote_tunnel(udid, pinned_address)
+        rsd, tunnel = await _open_remote_tunnel(udid, pinned_address, explicit_host=explicit_host)
         return rsd, tunnel, "iPhone (Wi-Fi)"
     except (UserspaceTunnelUnavailableError, DeviceNotFoundError, OSError) as remote_error:
+        if explicit_host or udid == MANUAL_UDID:
+            raise RuntimeError(f"无线连接失败：{remote_error}") from remote_error
         # Apple Devices can also publish a trusted Wi-Fi device through usbmux.
         # Explicitly require Network here: plugged-in USB must never pass a Wi-Fi test.
         async def network_provider():
@@ -665,7 +710,7 @@ async def _verify_wireless_address(udid: str, address: str) -> tuple[bool, str]:
     """只有无线认证及 RSD 均通过，才允许提示拔线。"""
     try:
         host, port = _pinned_endpoints(address)[0]
-        rsd, tunnel = await _attempt_remote_endpoint(udid, host, port, 6.0, autopair=True)
+        rsd, tunnel = await _attempt_remote_endpoint(udid, host, port, 6.0)
         try:
             await rsd.close()
         finally:
@@ -1103,17 +1148,13 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         return 200, b"ok"
 
 
-async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "") -> int:
+async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "", *, explicit_host: bool = False) -> int:
     stack_ctx = None
     rsd: Optional[RemoteServiceDiscoveryService] = None
     try:
-        rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host)
-        # 手填地址直连未知设备时用哨兵 udid；配对完成后按真实 UDID 落盘并沿用。
+        rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host, explicit_host=explicit_host)
         if wireless and udid == MANUAL_UDID:
-            real_udid = getattr(rsd, "udid", "")
-            if real_udid and real_udid != MANUAL_UDID:
-                _adopt_manual_record(real_udid)
-                udid = real_udid
+            udid = rsd.udid
         if DisplayService.SERVICE_NAME not in rsd.peer_info.get("Services", {}):
             await _ensure_ddi_mounted(rsd)
             with contextlib.suppress(Exception):
@@ -1121,7 +1162,7 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "") -> int
             if stack_ctx is not None:
                 with contextlib.suppress(Exception):
                     await stack_ctx.aclose()
-            rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host)
+            rsd, stack_ctx, device_name = await _open_rsd(udid, wireless, host, explicit_host=explicit_host)
 
         version_str = str(rsd.product_version)
         major = int(version_str.split(".")[0]) if version_str and version_str[0].isdigit() else 0
@@ -1268,6 +1309,7 @@ def main() -> int:
     serve_p.add_argument("--port", type=int, required=True)
     serve_p.add_argument("--wireless", action="store_true")
     serve_p.add_argument("--host", default="")
+    serve_p.add_argument("--explicit-host", action="store_true")
 
     pair_p = sub.add_parser("pair-wireless")
     pair_p.add_argument("--udid", required=True)
@@ -1276,7 +1318,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "pair-wireless":
         return asyncio.run(cmd_pair_wireless(args.udid, args.host))
-    return asyncio.run(cmd_serve(args.udid, args.port, args.wireless, args.host))
+    return asyncio.run(cmd_serve(args.udid, args.port, args.wireless, args.host, explicit_host=args.explicit_host))
 
 
 if __name__ == "__main__":

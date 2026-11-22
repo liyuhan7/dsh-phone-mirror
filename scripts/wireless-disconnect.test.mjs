@@ -13,7 +13,7 @@ const entry = new URL('../lib/index.js', import.meta.url)
 const source = readFileSync(entry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
 const serial = 'wifi:active-phone'
 
-function fixture() {
+function fixture(iosProvider) {
   const routes = new Map()
   const targets = []
   let tick
@@ -39,7 +39,7 @@ function fixture() {
   const apply = runInNewContext(`${source.replaceAll('import.meta.url', 'entry')}\napply`, {
     ...http, entry, URL, readFileSync, isIPv4, z: schema,
     createAndroidProvider: () => ({ status: async () => ({ devices: [] }) }),
-    createIosProvider: () => provider,
+    createIosProvider: () => iosProvider ?? provider,
     // 拔线监听用：测试里没有真实 usbmux，当作「USB 一直在」。
     queryUsbmuxDevices: async () => ({ ok: true, devices: [] }),
     clearInterval() {},
@@ -127,8 +127,8 @@ test('manual iOS wireless address overrides the learned address for connection a
     learnedWirelessHost: () => '192.0.2.1',
     saveLearnedWirelessHost: (...args) => saved.push(args),
     IosSession: class {
-      constructor({ host, serial }) {
-        started.push(host)
+      constructor({ host, serial, explicitHost }) {
+        started.push([host, explicitHost])
         // 与真实会话一致：从 wifi: 序列号推导 udid，供连接成功后落盘地址用。
         this.udid = serial.startsWith('wifi:') ? serial.slice(5) : serial
         this.serial = serial
@@ -154,9 +154,10 @@ test('manual iOS wireless address overrides the learned address for connection a
   configured = '  '
   assert.equal((await provider.status()).devices[0].online, false)
   await provider.startSession({ serial })
-  assert.deepEqual(started, ['192.0.2.2:49153', '192.0.2.1'])
   assert.deepEqual(probed, [['192.0.2.2', 49153], ['192.0.2.1', 49152]])
+  configured = '192.0.2.2:49153'
   await provider.startSession({ serial, iosWirelessHost: '192.0.2.3' })
+  assert.deepEqual(started, [['192.0.2.2:49153', true], ['192.0.2.1', false], ['192.0.2.3', true]])
   assert.deepEqual(saved, [['active-phone', '192.0.2.3']])
   failStart = true
   await assert.rejects(provider.startSession({ serial, iosWirelessHost: '192.0.2.4' }), /verification failed/)
@@ -176,10 +177,59 @@ test('manual iOS IPv4 is validated and retained for wireless recovery', async ()
   assert.deepEqual(targets.map((target) => target.iosWirelessHost), ['192.0.2.3', '192.0.2.3'])
 })
 
-test('manual iOS address connects unpaired devices via sentinel serial', async () => {
-  const { call, targets } = fixture()
-  await call('/connect', { platform: 'ios', serial: 'wifi:manual', iosWirelessHost: '192.0.2.9' })
-  assert.equal(targets[0].iosWirelessHost, '192.0.2.9')
+test('manual iOS connection stays listed and can reconnect after the top disconnect', async () => {
+  const providerEntry = new URL('../lib/providers/ios/index.js', import.meta.url)
+  const providerSource = readFileSync(providerEntry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+  const udid = serial.slice(5)
+  const records = []
+  const hosts = new Map()
+  const started = []
+  const createProvider = runInNewContext(`${providerSource.replaceAll('import.meta.url', 'entry')}\ncreateIosProvider`, {
+    entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
+    existsSync: (path) => !path.endsWith('.plist') && !path.endsWith('.plist.tmp'),
+    readdirSync: () => records,
+    runtimeState: { preparing: false, message: '' },
+    learnedWirelessHost: (id) => hosts.get(id),
+    saveLearnedWirelessHost: (id, host) => hosts.set(id, host),
+    IosSession: class extends EventEmitter {
+      constructor({ serial: requested, host }) {
+        super()
+        this.serial = requested
+        this.host = host
+      }
+      async start() {
+        started.push([this.serial, this.host])
+        if (this.serial === 'wifi:manual') records.push(`remote_${udid}.plist`)
+        this.serial = serial
+        this.udid = udid
+      }
+      async stop() {}
+    },
+    netConnect(options) {
+      const socket = new EventEmitter()
+      socket.setTimeout = socket.destroy = () => {}
+      const xml = Buffer.from(`<key>Properties</key><dict><key>SerialNumber</key><string>${udid}</string><key>ConnectionType</key><string>Network</string></dict>`)
+      const header = Buffer.alloc(16)
+      header.writeUInt32LE(16 + xml.length)
+      queueMicrotask(() => options.host === '192.0.2.9'
+        ? socket.emit('connect') : socket.emit('data', Buffer.concat([header, xml])))
+      return socket
+    }
+  })
+  const { call, tick } = fixture(createProvider({}))
+  const request = { platform: 'ios', serial: 'wifi:manual', iosWirelessHost: '192.0.2.9' }
+  assert.equal((await call('/connect', request)).session.serial, serial)
+  assert.equal((await call('/status')).devices.find((device) => device.serial === serial).state, 'device')
+  await call('/disconnect', {})
+  const stopped = await call('/status')
+  assert.equal(stopped.session.state, 'idle')
+  assert.equal(stopped.autoConnecting, false)
+  assert.equal(stopped.devices.find((device) => device.serial === serial).state, 'device')
+  tick()
+  await flush()
+  assert.equal(started.length, 1)
+  assert.equal((await call('/connect', { platform: 'ios', serial })).session.serial, serial)
+  assert.deepEqual(started, [['wifi:manual', '192.0.2.9'], [serial, '192.0.2.9']])
 })
 
 test('disconnect stops the named wireless session but preserves pairing and USB', async () => {

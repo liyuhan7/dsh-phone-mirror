@@ -1,7 +1,9 @@
 import asyncio
 import base64
 from pathlib import Path
+import plistlib
 import sys
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -278,30 +280,98 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
             patch.object(bridge.pmd_pair_records, "get_local_pairing_record", return_value=None),
             patch.object(bridge, "_attempt_remote_endpoint", attempt),
         ):
-            self.assertEqual(await bridge._open_remote_tunnel("test", "192.0.2.2"), (rsd, tunnel))
-        attempt.assert_awaited_once_with(
-            "test", "192.0.2.2", bridge._REMOTE_PAIRING_PORT,
-            unittest.mock.ANY, autopair=True,
-        )
-        # 首次配对要等用户在手机上点「信任」，预算必须足够长。
-        self.assertGreaterEqual(attempt.await_args.args[3], 60.0)
+            self.assertEqual(await bridge._open_remote_tunnel("test", "192.0.2.2", explicit_host=True), (rsd, tunnel))
+        attempt.assert_awaited_once_with("test", "192.0.2.2", bridge._REMOTE_PAIRING_PORT, 45.0, autopair=True)
 
-    def test_adopt_manual_record_renames_to_real_udid(self):
-        from pathlib import Path
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp)
-            (home / "remote_manual.plist").write_bytes(b"record")
-            with (
-                patch.object(bridge, "_PMD_HOME", home),
-                patch.object(bridge.contextlib, "suppress"),
-            ):
-                bridge._adopt_manual_record("00008120-REAL")
-            self.assertFalse((home / "remote_manual.plist").exists())
-            self.assertEqual((home / "remote_00008120-REAL.plist").read_bytes(), b"record")
-            # 哨兵记录不存在时是安全的空操作。
-            bridge._adopt_manual_record("00008120-OTHER")
-            self.assertFalse((home / "remote_00008120-OTHER.plist").exists())
+    async def test_manual_address_tries_existing_records_at_the_typed_ip_only(self):
+        rsd, tunnel = object(), object()
+        attempt = AsyncMock(side_effect=[OSError("RemotePairing 配对验证失败"), (rsd, tunnel)])
+        with (
+            patch.object(bridge.pmd_pair_records, "iter_remote_paired_identifiers", return_value=iter(["other", "real"])),
+            patch.object(bridge, "_attempt_remote_endpoint", attempt),
+        ):
+            self.assertEqual(
+                await bridge._open_remote_tunnel(bridge.MANUAL_UDID, "192.0.2.2", explicit_host=True), (rsd, tunnel),
+            )
+        self.assertEqual([call.args[:3] for call in attempt.await_args_list], [
+            ("other", "192.0.2.2", 49152), ("real", "192.0.2.2", 49152),
+        ])
+        self.assertTrue(all(call.kwargs == {"adopt_record": True} for call in attempt.await_args_list))
+
+    async def test_explicit_address_failure_does_not_switch_endpoints(self):
+        with (
+            patch.object(bridge.pmd_pair_records, "get_local_pairing_record", return_value={"peer_alt_irk": bytes(16)}),
+            patch.object(bridge, "browse_remotepairing", AsyncMock()) as browse,
+            patch.object(bridge, "create_using_usbmux", AsyncMock()) as mux,
+            patch.object(bridge, "_attempt_remote_endpoint", AsyncMock(side_effect=OSError("TCP 建连失败"))) as attempt,
+        ):
+            with self.assertRaisesRegex(RuntimeError, r"192\.0\.2\.2:49152"):
+                await bridge._open_rsd("test", True, "192.0.2.2", explicit_host=True)
+        attempt.assert_awaited_once()
+        self.assertEqual(attempt.await_args.args[:3], ("test", "192.0.2.2", 49152))
+        browse.assert_not_awaited()
+        mux.assert_not_awaited()
+
+    async def test_manual_address_uses_peer_identity_and_upstream_pairing(self):
+        protocol = bridge.tunnel_service.RemotePairingProtocol
+        manual_service = bridge.tunnel_service.RemotePairingManualPairingService
+        peer_id = "pairing-identifier"
+        real_udid = "00008120-REAL"
+
+        async def handshake(service):
+            service.handshake_info = {"peerDeviceInfo": {"identifier": peer_id}}
+
+        for initial_record in (False, True):
+            with self.subTest(initial_record=initial_record), TemporaryDirectory() as tmp:
+                home = Path(tmp)
+                record = {"private_key": bytes(32)}
+                record_bytes = plistlib.dumps(record)
+                handshake_record = home / f"remote_{peer_id}.plist"
+                if initial_record:
+                    handshake_record.write_bytes(record_bytes)
+
+                async def verify(service):
+                    return service.pair_record == record
+
+                async def pair(service):
+                    self.assertEqual(service.remote_identifier, peer_id)
+                    service.pair_record_path.write_bytes(record_bytes)
+
+                def init_keys(service):
+                    service.client_cip = object()
+
+                rsd = SimpleNamespace(udid=real_udid)
+
+                def make_tunnel(*, provider_factory):
+                    async def open_tunnel():
+                        await provider_factory()
+                        return rsd
+                    return SimpleNamespace(aopen=open_tunnel, aclose=AsyncMock())
+
+                with (
+                    patch.object(bridge, "_PMD_HOME", home),
+                    patch.object(bridge.tunnel_service, "create_pairing_records_cache_folder", return_value=home),
+                    patch.object(manual_service, "open_stream", AsyncMock()) as tcp,
+                    patch.object(manual_service, "close", AsyncMock()),
+                    patch.object(protocol, "_attempt_pair_verify", handshake),
+                    patch.object(protocol, "_validate_pairing", verify),
+                    patch.object(protocol, "_pair", autospec=True, side_effect=pair) as pair_mock,
+                    patch.object(protocol, "_init_client_server_main_encryption_keys", init_keys),
+                    patch.object(bridge, "_emit"),
+                    patch.object(bridge.userspace_tunnel, "UserspaceRsdTunnel", side_effect=make_tunnel),
+                    patch.object(bridge.userspace_tunnel, "TunnelProvider") as provider,
+                ):
+                    result, _ = await bridge._attempt_remote_endpoint(
+                        bridge.MANUAL_UDID, "192.0.2.2", 49152, 1.0, autopair=True,
+                    )
+                    self.assertIs(result, rsd)
+                    self.assertEqual(tcp.await_count, 1 if initial_record else 2)
+                    self.assertEqual(pair_mock.await_count, 0 if initial_record else 1)
+                    provider.assert_called_once()
+                    self.assertFalse(handshake_record.exists())
+                    self.assertEqual((home / f"remote_{real_udid}.plist").read_bytes(), record_bytes)
+                    # 后续会话直接按设备列表里的真实 UDID 读取配对记录。
+                    self.assertEqual(manual_service(real_udid, "192.0.2.2", 49152).pair_record, record)
 
     async def test_learning_uses_outgoing_phone_packets_without_tcp_probe(self):
         import socket
@@ -439,7 +509,7 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         attempt = AsyncMock(return_value=(rsd, tunnel))
         with patch.object(bridge, "_attempt_remote_endpoint", attempt):
             self.assertEqual(await bridge._verify_wireless_address("test", "192.0.2.2"), (True, ""))
-        attempt.assert_awaited_once_with("test", "192.0.2.2", bridge._REMOTE_PAIRING_PORT, 6.0, autopair=True)
+        attempt.assert_awaited_once_with("test", "192.0.2.2", bridge._REMOTE_PAIRING_PORT, 6.0)
         rsd.close.assert_awaited_once()
         tunnel.aclose.assert_awaited_once()
 
