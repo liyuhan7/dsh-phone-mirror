@@ -875,6 +875,69 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         # 同一次 needs_key 定格最多补发 2 次，不会引发 PLI 风暴。
         self.assertEqual(plis, ["needs-key-retry", "needs-key-retry"])
 
+    async def test_udp_bypass_routes_media_packets_and_falls_back_others(self):
+        import ipaddress
+        import struct
+
+        closed = []
+
+        def fake_init(self):
+            self._local_ip = "fd00::1"
+            self._port = 41234
+
+        def fake_close(self):
+            closed.append(self._port)
+
+        def ipv6_pkt(dst_ip, nxt, payload):
+            src = ipaddress.IPv6Address("fd00::2").packed
+            dst = ipaddress.IPv6Address(dst_ip).packed
+            hdr = struct.pack("!IHBB", 0x60000000, len(payload), nxt, 64) + src + dst
+            return bridge._TUN_LO_HDR + hdr + payload
+
+        def udp_seg(src_port, dst_port, body):
+            return struct.pack("!HHHH", src_port, dst_port, 8 + len(body), 0) + body
+
+        fallback = []
+        tun = SimpleNamespace(_link=object(), _addr="fd00::1", _rx_since_tx=False)
+        with (
+            patch.object(bridge, "_orig_userspace_tun_write", side_effect=lambda _s, d: fallback.append(d)),
+            patch.object(bridge._orig_userspace_udp, "__init__", fake_init),
+            patch.object(bridge._orig_userspace_udp, "close", fake_close),
+        ):
+            udp = bridge._BypassUserspaceUdp()
+            try:
+                # 1) 命中端口的 IPv6/UDP 直接送入旁路，不走 pmd-pytcp。
+                waiter = asyncio.create_task(udp.recv())
+                await asyncio.sleep(0)
+                media = ipv6_pkt("fd00::1", 17, udp_seg(5000, 41234, b"rtp-frame-1"))
+                bridge._fast_userspace_tun_write(tun, media)
+                self.assertEqual(await waiter, b"rtp-frame-1")
+                self.assertTrue(tun._rx_since_tx)
+                self.assertEqual(fallback, [])
+
+                # 2) 先到队列再 recv。
+                bridge._fast_userspace_tun_write(tun, ipv6_pkt("fd00::1", 17, udp_seg(5000, 41234, b"rtp-frame-2")))
+                self.assertEqual(await udp.recv(), b"rtp-frame-2")
+
+                # 3) TCP / 未注册端口 / 目的 IP 不匹配均回落原栈。
+                tcp_pkt = ipv6_pkt("fd00::1", 6, b"x" * 20)
+                other_port = ipv6_pkt("fd00::1", 17, udp_seg(5000, 49999, b"other"))
+                wrong_ip = ipv6_pkt("fd00::9", 17, udp_seg(5000, 41234, b"wrong"))
+                for pkt in (tcp_pkt, other_port, wrong_ip):
+                    bridge._fast_userspace_tun_write(tun, pkt)
+                self.assertEqual(fallback, [tcp_pkt, other_port, wrong_ip])
+
+                # 4) close() 注销端口并唤醒挂起中的 recv() 抛 OSError。
+                pending = asyncio.create_task(udp.recv())
+                await asyncio.sleep(0)
+                udp.close()
+                with self.assertRaises(OSError):
+                    await pending
+                self.assertNotIn(41234, bridge._UDP_BYPASS)
+                self.assertEqual(closed, [41234])
+            finally:
+                bridge._UDP_BYPASS.pop(41234, None)
+
 
 if __name__ == "__main__":
     unittest.main()

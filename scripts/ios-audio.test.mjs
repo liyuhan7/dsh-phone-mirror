@@ -154,3 +154,76 @@ test('audio-worklet crossfades catch-up drops instead of hard-jumping samples', 
   const endFadeSlot = (sink.read + sink.fade - 1) % sink.capacity
   assert.equal(sink.left[endFadeSlot], 0)
 })
+
+test('wireless audio raises target floor/ceiling and remembers safe floor across 30s decay', { timeout: 4000 }, async () => {
+  const intervals = []
+  let fakeNow = 100_000
+  const streams = {}
+  const posted = []
+  const FakeDate = class extends Date {
+    static now() { return fakeNow }
+  }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    Date: FakeDate,
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval(fn, ms) { intervals.push({ fn, ms }); return intervals.length },
+    clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url, options) => {
+      const target = String(url)
+      if (options?.method === 'POST') return new Response('{"ok":true}')
+      if (target.endsWith('/codec')) return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      const key = target.endsWith('/audio.bin') ? 'audio' : target.endsWith('/stream.bin') ? 'direct' : 'host'
+      return new Response(new ReadableStream({ start(controller) { streams[key] = controller } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode() {}
+      close() { this.state = 'closed' }
+    }
+  })
+  const canvas = { width: 300, height: 150, getContext: () => ({ fillRect() {} }) }
+  const engine = createEngine({ canvas, post: (m) => posted.push(m) })
+  const targets = []
+  const port = { onmessage: null, postMessage(m) { if (m.type === 'target') targets.push(m.ms) } }
+  engine.handle({ type: 'audio-port', port })
+  engine.handle({
+    type: 'open', streamUrl: '/video', controlUrl: '/control',
+    directVideoUrl: 'http://127.0.0.1:49152/stream.bin'
+  })
+  try {
+    await until(() => streams.host)
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', serial: 'wifi:00008120', audio: true, screen: { width: 1290, height: 2796 }
+    }))))
+    await until(() => targets.at(-1) === 160)
+
+    // 连续欠载：无线目标最高抬到 360 ms，并记住安全水位下限（180 -> 220 -> 240 封顶）。
+    port.onmessage({ data: { type: 'underrun' } })
+    assert.equal(targets.at(-1), 200)
+    for (let i = 0; i < 6; i += 1) port.onmessage({ data: { type: 'underrun' } })
+    assert.equal(targets.at(-1), 360)
+
+    const decay = intervals.find((item) => item.ms === 5000)?.fn
+    assert.ok(decay)
+    // 10s 未满 30s 冷却期：不回退。
+    fakeNow += 10_000
+    decay()
+    assert.equal(targets.at(-1), 360)
+
+    // 每过 30s 缓慢回落 20 ms，停在记住的安全水位 240 ms，不退回 80 ms。
+    for (let step = 0; step < 10; step += 1) {
+      fakeNow += 30_000
+      decay()
+    }
+    assert.equal(targets.at(-1), 240)
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})

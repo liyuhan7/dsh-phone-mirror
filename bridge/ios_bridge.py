@@ -29,7 +29,7 @@ import struct
 import sys
 import tempfile
 import time
-from collections import Counter
+from collections import Counter, deque
 from functools import partial
 from pathlib import Path
 from typing import Any, Optional
@@ -405,6 +405,89 @@ async def _batched_tcp_sock_read_task(self) -> None:
 
 
 tunnel_service.RemotePairingTcpTunnel.sock_read_task = _batched_tcp_sock_read_task
+
+
+# 入站音视频 UDP 旁路：媒体 RTP 包在进入纯 Python pmd-pytcp 协议栈前按目的端口截走，
+# 跳过 L2/IPv6/UDP 逐包解析与 Windows 回环 eventfd，出站 RTCP/控制面 TCP 仍走原栈。
+_UDP_BYPASS: dict[int, Any] = {}
+_UDP_BYPASS_MAX_QUEUE = 2048
+_TUN_LO_HDR = userspace_tunnel.LOOPBACK_HEADER
+_TUN_LO_LEN = len(_TUN_LO_HDR)
+_orig_userspace_udp = userspace_tunnel.UserspaceUdp
+_orig_userspace_tun_write = userspace_tunnel.UserspaceTun.write
+
+
+class _BypassUserspaceUdp(_orig_userspace_udp):
+    def __init__(self) -> None:
+        super().__init__()
+        self._rx: deque[bytes] = deque()
+        self._waiter: Optional[asyncio.Future[bytes]] = None
+        self._closed = False
+        _UDP_BYPASS[self._port] = self
+
+    def feed(self, payload: bytes) -> None:
+        if self._closed:
+            return
+        waiter = self._waiter
+        if waiter is not None and not waiter.done():
+            self._waiter = None
+            waiter.set_result(payload)
+            return
+        if len(self._rx) >= _UDP_BYPASS_MAX_QUEUE:
+            self._rx.popleft()
+        self._rx.append(payload)
+
+    async def recv(self, bufsize: int = 65535) -> bytes:
+        if self._rx:
+            return self._rx.popleft()
+        if self._closed:
+            raise OSError("UDP socket closed")
+        fut: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+        self._waiter = fut
+        try:
+            return await fut
+        finally:
+            if self._waiter is fut:
+                self._waiter = None
+
+    def close(self) -> None:
+        self._closed = True
+        if _UDP_BYPASS.get(self._port) is self:
+            _UDP_BYPASS.pop(self._port, None)
+        waiter, self._waiter = self._waiter, None
+        if waiter is not None and not waiter.done():
+            waiter.set_exception(OSError("UDP socket closed"))
+        self._rx.clear()
+        super().close()
+
+
+def _fast_userspace_tun_write(self, data: bytes) -> None:
+    if _UDP_BYPASS and self._link is not None:
+        off = _TUN_LO_LEN if data[:_TUN_LO_LEN] == _TUN_LO_HDR else 0
+        rem = len(data) - off
+        if rem >= 48 and (data[off] >> 4) == 6 and data[off + 6] == 17:
+            dst_port = (data[off + 42] << 8) | data[off + 43]
+            target = _UDP_BYPASS.get(dst_port)
+            if target is not None:
+                addr = self._addr
+                if addr:
+                    if getattr(self, "_bypass_addr_str", None) != addr:
+                        self._bypass_addr_str = addr
+                        self._bypass_addr = ipaddress.IPv6Address(addr).packed
+                    addr_bytes = self._bypass_addr
+                else:
+                    addr_bytes = None
+                if addr_bytes is None or data[off + 24 : off + 40] == addr_bytes:
+                    udp_len = (data[off + 44] << 8) | data[off + 45]
+                    if 8 <= udp_len <= rem - 40:
+                        self._rx_since_tx = True
+                        target.feed(data[off + 48 : off + 40 + udp_len])
+                        return
+    return _orig_userspace_tun_write(self, data)
+
+
+userspace_tunnel.UserspaceUdp = _BypassUserspaceUdp  # type: ignore[misc]
+userspace_tunnel.UserspaceTun.write = _fast_userspace_tun_write  # type: ignore[method-assign]
 
 
 async def _attempt_remote_endpoint(
