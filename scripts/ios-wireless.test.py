@@ -529,6 +529,68 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
                     rsd.close.assert_awaited_once()
                     tunnel.aclose.assert_awaited_once()
 
+    async def test_scroll_gesture_closes_even_when_hid_link_is_gone(self):
+        """链路在 120ms 收口窗口里断掉时，也必须清掉 _scroll_active。
+
+        留着 active 会让之后每次滚动都只发 changed、不发 begin，
+        设备侧没有进行中的手势，滚轮从此失效，只能靠重连恢复。
+        """
+        from types import MethodType
+
+        holder = SimpleNamespace(_uhs=None, _scroll_active=True, _hid_lock=asyncio.Lock())
+        holder._close_scroll_gesture = MethodType(
+            bridge.MirrorScreenStreamServer._close_scroll_gesture, holder
+        )
+        await holder._close_scroll_gesture()
+        self.assertFalse(holder._scroll_active)
+
+        # 链路还在：先发 ended，再清状态。
+        send_report = AsyncMock()
+        alive = SimpleNamespace(
+            _uhs=SimpleNamespace(send_report=send_report),
+            _scroll_active=True,
+            _hid_lock=asyncio.Lock(),
+        )
+        alive._close_scroll_gesture = MethodType(
+            bridge.MirrorScreenStreamServer._close_scroll_gesture, alive
+        )
+        await alive._close_scroll_gesture()
+        self.assertFalse(alive._scroll_active)
+        service, report = send_report.await_args.args
+        self.assertEqual(service, bridge.DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE)
+        self.assertEqual(report[1], 0x04)
+
+    async def test_scroll_restarts_gesture_after_hid_link_rebuild(self):
+        """链路重建后不能接着发 changed：必须重新 mayBegin+began。"""
+        from types import MethodType
+
+        reports = []
+        uhs = SimpleNamespace(send_report=AsyncMock(side_effect=lambda service, report: reports.append(report)))
+        holder = SimpleNamespace(_uhs=None, _scroll_active=True, _hid_lock=asyncio.Lock())
+
+        async def ensure_hid():
+            holder._uhs = uhs
+
+        holder._ensure_hid_ready = AsyncMock()
+        holder._ensure_hid = ensure_hid
+        holder._hid_kick = lambda: None
+        holder._schedule_scroll_end = lambda: None
+        holder._send_scroll = MethodType(bridge.MirrorScreenStreamServer._send_scroll, holder)
+
+        await holder._send_scroll({"x": 0.5, "y": 0.5, "dx": 0, "dy": 1})
+        phases = [report[1] for report in reports]
+        self.assertIn(0x80, phases, phases)
+        self.assertIn(0x01, phases, phases)
+        self.assertTrue(holder._scroll_active)
+
+        # 链路一直在：后续增量只发 changed，不重复 begin。
+        reports.clear()
+        await holder._send_scroll({"x": 0.5, "y": 0.5, "dx": 0, "dy": 1})
+        phases = [report[1] for report in reports]
+        self.assertNotIn(0x80, phases, phases)
+        self.assertNotIn(0x01, phases, phases)
+        self.assertIn(0x02, phases, phases)
+
 
 if __name__ == "__main__":
     unittest.main()

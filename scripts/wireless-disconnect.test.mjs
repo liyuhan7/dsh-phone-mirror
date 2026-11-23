@@ -286,3 +286,55 @@ for (const when of ['probe', 'startup']) {
     assert.ok(targets.every((target) => target.stopped))
   })
 }
+
+test('manual address stays listed and reconnectable after the wireless device is hidden', async () => {
+  const providerEntry = new URL('../lib/providers/ios/index.js', import.meta.url)
+  const providerSource = readFileSync(providerEntry, 'utf8').replace(/\r\n/g, '\n').replace(/^import .*\n/gm, '').replace(/^export /gm, '')
+  const udid = 'active-phone'
+  const started = []
+  const createProvider = runInNewContext(`${providerSource.replaceAll('import.meta.url', 'entry')}\ncreateIosProvider`, {
+    entry: providerEntry, dirname, join, fileURLToPath, Buffer, process, homedir: () => '.',
+    existsSync: () => true, readdirSync: () => [`remote_${udid}.plist`],
+    runtimeState: { preparing: false, message: '' },
+    learnedWirelessHost: () => '',
+    saveLearnedWirelessHost: () => {},
+    IosSession: class {
+      constructor({ host, serial, explicitHost }) {
+        started.push({ host, explicitHost })
+        // 与真实会话一致：手填哨兵在配对后换成真实 UDID。
+        this.serial = serial === 'wifi:manual' ? `wifi:${udid}` : serial
+        this.udid = this.serial.slice('wifi:'.length)
+      }
+      async start() {}
+      async stop() {}
+    },
+    netConnect(options) {
+      const socket = new EventEmitter()
+      socket.setTimeout = socket.destroy = () => {}
+      if (options.port === 27015) {
+        const xml = Buffer.from(`<key>Properties</key><dict><key>SerialNumber</key><string>${udid}</string><key>ConnectionType</key><string>Network</string></dict>`)
+        const header = Buffer.alloc(16)
+        header.writeUInt32LE(16 + xml.length)
+        queueMicrotask(() => socket.emit('data', Buffer.concat([header, xml])))
+      } else {
+        queueMicrotask(() => socket.emit('connect'))
+      }
+      return socket
+    }
+  })
+  const provider = createProvider({ getSettings: () => ({ audio: false, iosWirelessHost: '' }) })
+  const listed = async () => Array.from((await provider.status()).devices, (device) => device.serial)
+
+  // 手填地址连上后，记住这个地址。
+  await provider.startSession({ serial: 'wifi:manual', iosWirelessHost: '192.0.2.9' })
+  assert.deepEqual(started[0], { host: '192.0.2.9', explicitHost: true })
+  assert.deepEqual(await listed(), [`wifi:${udid}`])
+
+  // 底部「断开连接」把它从列表移除后，手填入口仍然在，且能直接重连。
+  await provider.disconnectWireless(`wifi:${udid}`)
+  assert.deepEqual(await listed(), ['wifi:manual'])
+  await assert.rejects(provider.startSession({ serial: `wifi:${udid}` }), /无线连接已断开/)
+  await provider.startSession({ serial: 'wifi:manual' })
+  assert.equal(started.length, 2)
+  assert.deepEqual(started[1], { host: '192.0.2.9', explicitHost: true })
+})

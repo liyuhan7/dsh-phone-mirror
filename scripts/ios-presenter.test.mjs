@@ -332,3 +332,86 @@ test('reopening resets the transform before clearing the canvas', async () => {
   assert.equal(fill[4], 360)
   engine.handle({ type: 'close' })
 })
+
+// 媒体管线：解码帧写进 video 轨道，画布完全不参与，并能上报几何供主线程摆放。
+test('iOS decoded frames go to a video track instead of the canvas', async () => {
+  const blits = []
+  const written = []
+  const messages = []
+  const decoded = []
+  // 挡一下背压：写入端说“排满了”时引擎应该丢帧而不是排队。
+  let congested = false
+  let controller
+  const canvas = { width: 300, height: 150, getContext: () => ({
+    fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}, setTransform() {},
+    drawImage: (f, x, y, w, h) => blits.push([f.id, w, h])
+  }) }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async () => new Response(new ReadableStream({ start(c) { controller = c } })),
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage: (f, x, y, w, h) => blits.push([f.id, w, h]) } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoTrackGenerator: class {
+      constructor() {
+        this.track = { kind: 'video' }
+        this.desiredSize = 2
+        this.writable = {
+          getWriter: () => ({
+            get desiredSize() { return congested ? 0 : 2 },
+            write: (frame) => { written.push(frame.id); return Promise.resolve() },
+            close: () => Promise.resolve()
+          })
+        }
+      }
+    },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        const id = chunk.data[0]
+        const f = { id, displayWidth: 1290, displayHeight: 2796, closed: 0, close() { this.closed += 1 } }
+        decoded.push(f)
+        this.output(f)
+      }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas,
+    post(message, transfer) { messages.push({ message, transfer }) }
+  })
+  const send = (...frames) => controller.enqueue(Buffer.concat(frames))
+  const video = (id, flags = 0) => frame(KIND.VIDEO, videoPayload(flags, id, Buffer.of(id)))
+  engine.handle({ type: 'open', streamUrl: '/video' })
+  try {
+    send(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1290, height: 2796 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))), video(1, VIDEO_FLAGS.KEY), video(2))
+    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve))
+
+    const track = messages.find((entry) => entry.message.type === 'track')
+    assert.ok(track, '没有把轨道传给主线程')
+    assert.equal(track.transfer.length, 1)
+    assert.equal(track.transfer[0], track.message.track)
+    assert.deepEqual(written, [1, 2])
+    // 画布一帧都不该画。
+    assert.equal(blits.length, 0)
+    const geometry = messages.filter((entry) => entry.message.type === 'geometry').at(-1).message
+    assert.deepEqual([geometry.width, geometry.height, geometry.rotation], [1290, 2796, 0])
+
+    // 排满了就丢帧：不写进轨道，并且立刻释放帧。
+    congested = true
+    send(video(3))
+    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(written, [1, 2])
+    assert.equal(decoded.at(-1).closed, 1)
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})

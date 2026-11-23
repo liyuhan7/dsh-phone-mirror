@@ -1008,8 +1008,13 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             round(float(scroll.get("x", 0.5)) * 65536),
             round(float(scroll.get("y", 0.5)) * 65536),
         )
+        had_link = self._uhs is not None
         await self._ensure_hid_ready()
         await self._ensure_hid()
+        # 链路是这次调用里新建的：上一个手势的 ended 到不了设备，
+        # 必须从 mayBegin+began 重新开始，不能接着发 changed。
+        if not had_link:
+            self._scroll_active = False
         service = DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE
         # 持续手势：首个增量走 mayBegin+began，后续增量走 changed，停止 120ms 后发 ended；
         # 不发 momentum，滚轮停下即停住。
@@ -1041,21 +1046,28 @@ class MirrorScreenStreamServer(ScreenStreamServer):
 
     def _scroll_end(self) -> None:
         self._scroll_end_handle = None
+        asyncio.create_task(self._close_scroll_gesture())
 
-        async def close() -> None:
-            async with self._hid_lock:
-                if not self._scroll_active or self._uhs is None:
-                    return
-                try:
-                    await self._uhs.send_report(
-                        DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE, _scroll_report(0, 0, 0x04)
-                    )
-                except Exception:
-                    logging.debug("scroll end failed", exc_info=True)
-                finally:
-                    self._scroll_active = False
+    async def _close_scroll_gesture(self) -> None:
+        """收口滚动手势。
 
-        asyncio.create_task(close())
+        链路已经断开时也必须清掉 _scroll_active：残留的 active 会让之后每次
+        滚动都只发 changed、不再发 mayBegin+began，设备侧没有进行中的手势，
+        滚轮就彻底失效，直到重连把 HID 会话整个拆掉。
+        """
+        async with self._hid_lock:
+            uhs = self._uhs
+            if not self._scroll_active:
+                return
+            self._scroll_active = False
+            if uhs is None:
+                return
+            try:
+                await uhs.send_report(
+                    DIGITIZER_SURFACE_TOUCHSCREEN_GESTURE, _scroll_report(0, 0, 0x04)
+                )
+            except Exception:
+                logging.debug("scroll end failed", exc_info=True)
 
     async def _watch_orientation(self) -> None:
         """跟随 displayinfoupdates 推送，手机朝向变化时把键盘交还给手机输入法。
