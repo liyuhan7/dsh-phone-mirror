@@ -16,9 +16,10 @@ const harness = ({ audioResponse } = {}) => {
     self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
     setInterval() { return 1 }, clearInterval() {},
     requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
-    fetch: async (url) => {
+    fetch: async (url, options) => {
       const target = String(url)
       fetched.push(target)
+      if (options?.method === 'POST') return new Response('{"ok":true}')
       if (target.endsWith('/codec')) {
         return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
       }
@@ -105,7 +106,7 @@ test('iOS audio subscribes to the sidecar and drops the host relay copy', { time
 })
 
 test('sidecar audio refusal falls back to the host relay', { timeout: 4000 }, async () => {
-  const { engine, streams, port } = harness({ audioResponse: new Response('audio disabled', { status: 503 }) })
+  const { engine, streams, fetched, port } = harness({ audioResponse: new Response('audio disabled', { status: 503 }) })
   engine.handle({ type: 'audio-port', port })
   engine.handle({
     type: 'open', streamUrl: '/video', controlUrl: '/control',
@@ -113,6 +114,10 @@ test('sidecar audio refusal falls back to the host relay', { timeout: 4000 }, as
   })
   try {
     await until(() => streams.host)
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', audio: true, screen: { width: 1290, height: 2796 }
+    }))))
+    await until(() => fetched.some((url) => url.includes('kind=audio-relay&on=1')))
     streams.host.enqueue(hostPcm(1000))
     await until(() => port.posted.some((message) => message.type === 'pcm'))
     const pcm = port.posted.find((message) => message.type === 'pcm')
@@ -120,4 +125,32 @@ test('sidecar audio refusal falls back to the host relay', { timeout: 4000 }, as
   } finally {
     engine.handle({ type: 'close' })
   }
+})
+
+test('audio-worklet crossfades catch-up drops instead of hard-jumping samples', () => {
+  const workletSource = readFileSync(new URL('../lib/audio-worklet.js', import.meta.url), 'utf8')
+  let Processor
+  runInNewContext(workletSource, {
+    sampleRate: 48000,
+    AudioWorkletProcessor: class { constructor() { this.port = { onmessage: null, postMessage() {} } } },
+    registerProcessor(_name, cls) { Processor = cls }
+  })
+  const sink = new Processor({ processorOptions: { targetMs: 80 } })
+  // 忽略非法 targetMs，防止 NaN 破坏缓冲状态。
+  sink.port.onmessage({ data: { type: 'target', ms: NaN } })
+  assert.equal(sink.target, 3840)
+
+  // 先缓冲到进入播放态，再制造超过 400ms 的积压触发追帧丢样。
+  const ones = new Float32Array(19200).fill(1)
+  const zeros = new Float32Array(19200).fill(0)
+  sink.push(ones, ones)
+  const out = [new Float32Array(128), new Float32Array(128)]
+  sink.process([], [out])
+  assert.equal(sink.playing, true)
+
+  sink.push(zeros, zeros)
+  // 丢样起点紧接旧样本（1.0），经过 5ms 交叉淡化平稳过渡到新样本（0.0），不硬跳。
+  assert.ok(sink.left[sink.read] > 0.9, `expected smooth fade-out from ~1.0, got ${sink.left[sink.read]}`)
+  const endFadeSlot = (sink.read + sink.fade - 1) % sink.capacity
+  assert.equal(sink.left[endFadeSlot], 0)
 })

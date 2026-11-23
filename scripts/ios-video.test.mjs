@@ -86,9 +86,9 @@ test('iOS resync starts at a live keyframe and never replays cached video', { ti
   })
   try {
     await drain(4)
-    // 解码顺序：缓存帧 1/2 与积压期增量 5 被丢弃。
+    // 解码顺序：缓存帧 1/2 与积压期增量 5 被丢弃；关键帧请求优先直发 sidecar /pli。
     assert.deepEqual(decoded.map((f) => f.id), [3, 4, 6, 7])
-    assert.ok(fetchedUrls.some((url) => url.includes('/control') && url.includes('kind=reset')))
+    assert.ok(fetchedUrls.includes('http://127.0.0.1:49152/pli'), JSON.stringify(fetchedUrls))
   } finally {
     engine.handle({ type: 'close' })
   }
@@ -295,6 +295,150 @@ test('engine reopen seeds the current rotation from /codec', { timeout: 4000 }, 
       geometry.some((g) => g.rotation === 90 && g.width === 2796 && g.height === 1290),
       JSON.stringify(geometry)
     )
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+test('direct video stamps chunks with monotonic arrival time', { timeout: 4000 }, async () => {
+  const timestamps = []
+  const streams = { host: null, direct: null }
+  let nowMs = 100
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    performance: { now: () => nowMs },
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      }
+      const key = target.endsWith('/stream.bin') ? 'direct' : 'host'
+      return new Response(new ReadableStream({ start(c) { streams[key] = c } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        timestamps.push(chunk.timestamp)
+        this.output({ displayWidth: 1080, displayHeight: 1920, closed: 0, close() {} })
+      }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas: { width: 100, height: 200, getContext: () => ({ drawImage() {}, setTransform() {}, fillRect() {} }) },
+    post() {}
+  })
+  const packet = (type, value) => {
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(2)
+    return Buffer.concat([prefix, Buffer.of(type, value)])
+  }
+  engine.handle({ type: 'open', streamUrl: '/video', directVideoUrl: 'http://127.0.0.1:49152/stream.bin' })
+  try {
+    for (let i = 0; i < 20 && (!streams.host || !streams.direct); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1080, height: 1920 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))))
+    // 同毫秒连到两帧，后一帧仍严格单调递增；间隔 50ms 后按真实到达时间推进。
+    streams.direct.enqueue(Buffer.concat([packet(2, 1), packet(1, 2)]))
+    for (let i = 0; i < 40 && timestamps.length < 2; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    nowMs = 150
+    streams.direct.enqueue(packet(1, 3))
+    for (let i = 0; i < 40 && timestamps.length < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.deepEqual(timestamps, [100000, 100001, 150000])
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+test('initial reset keyframe reuses a fresh decoder, while post-decode reset rebuilds it', { timeout: 4000 }, async () => {
+  let created = 0
+  let closed = 0
+  const decoded = []
+  const streams = { host: null, direct: null }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      }
+      const key = target.endsWith('/stream.bin') ? 'direct' : 'host'
+      return new Response(new ReadableStream({ start(c) { streams[key] = c } }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {}, setTransform() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output; created += 1 }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        decoded.push(chunk.data[0])
+        this.output({ displayWidth: 1080, displayHeight: 1920, closed: 0, close() {} })
+      }
+      close() { this.state = 'closed'; closed += 1 }
+    }
+  })
+  const engine = createEngine({
+    canvas: { width: 100, height: 200, getContext: () => ({ drawImage() {}, setTransform() {}, fillRect() {} }) },
+    post() {}
+  })
+  const packet = (type, value) => {
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(2)
+    return Buffer.concat([prefix, Buffer.of(type, value)])
+  }
+  engine.handle({ type: 'open', streamUrl: '/video', directVideoUrl: 'http://127.0.0.1:49152/stream.bin' })
+  try {
+    for (let i = 0; i < 20 && (!streams.host || !streams.direct); i += 1) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    streams.host.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1080, height: 1920 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))))
+    for (let i = 0; i < 20 && created < 1; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(created, 1)
+    assert.equal(closed, 0)
+
+    // 首次启动时 type=2 引导关键帧直接复用刚配置好的空解码器，不重复重建。
+    streams.direct.enqueue(Buffer.concat([packet(2, 1), packet(1, 2)]))
+    for (let i = 0; i < 40 && decoded.length < 2; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.deepEqual(decoded, [1, 2])
+    assert.equal(created, 1)
+    assert.equal(closed, 0)
+
+    // 已解过帧后收到新的 reset 关键帧，必须重建解码器以清掉旧参考帧。
+    streams.direct.enqueue(packet(2, 3))
+    for (let i = 0; i < 40 && decoded.length < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.deepEqual(decoded, [1, 2, 3])
+    assert.equal(created, 2)
+    assert.equal(closed, 1)
   } finally {
     engine.handle({ type: 'close' })
   }

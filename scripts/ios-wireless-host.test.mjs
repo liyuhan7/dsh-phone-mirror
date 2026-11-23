@@ -9,7 +9,33 @@ const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 const storePath = join(pluginRoot, '.tmp', 'ios-wireless-hosts.json')
 const backup = existsSync(storePath) ? readFileSync(storePath, 'utf8') : null
 
-const { learnedWirelessHost, saveLearnedWirelessHost } = await import('../lib/providers/ios/session.js')
+const { learnedWirelessHost, saveLearnedWirelessHost, sidecarEnv } = await import('../lib/providers/ios/session.js')
+
+test('sidecarEnv strips proxy variables and forces loopback NO_PROXY', () => {
+  const prev = {
+    HTTP_PROXY: process.env.HTTP_PROXY,
+    https_proxy: process.env.https_proxy,
+    ALL_PROXY: process.env.ALL_PROXY
+  }
+  try {
+    process.env.HTTP_PROXY = 'http://127.0.0.1:7890'
+    process.env.https_proxy = 'http://127.0.0.1:7890'
+    process.env.ALL_PROXY = 'socks5://127.0.0.1:7891'
+    const env = sidecarEnv({ PHONE_MIRROR_STDIN_QUIT: '1' })
+    assert.equal(env.HTTP_PROXY, undefined)
+    assert.equal(env.https_proxy, undefined)
+    assert.equal(env.ALL_PROXY, undefined)
+    assert.equal(env.NO_PROXY, '127.0.0.1,localhost,::1')
+    assert.equal(env.no_proxy, '127.0.0.1,localhost,::1')
+    assert.equal(env.PHONE_MIRROR_STDIN_QUIT, '1')
+    assert.equal(env.PYTHONIOENCODING, 'utf-8')
+  } finally {
+    for (const [k, v] of Object.entries(prev)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+})
 
 test('learned wireless hosts round-trip and prefer fresh values', () => {
   try {

@@ -199,8 +199,8 @@ class PyAVAACELDDecoder:
         return ctx
 
     def decode(self, au: bytes) -> bytes:
-        # 静音时设备只发 4 字节空包，按帧解码会触发上游的重建风暴。
-        if len(au) < 16:
+        # 静音时设备发 4 字节空包，跳过以免触发解码器重建；保留极小有效帧。
+        if len(au) <= 4:
             return b""
         out = bytearray()
         try:
@@ -308,6 +308,105 @@ def _pinned_endpoints(address: str) -> list[tuple[str, int]]:
 
 
 
+_TUNNEL_RCVBUF = 2 * 1024 * 1024
+_TUNNEL_SNDBUF = 1024 * 1024
+
+
+def _set_tcp_nodelay(sock: Any) -> None:
+    if sock is not None:
+        with contextlib.suppress(OSError, AttributeError):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def _tune_tunnel_socket(sock: Any) -> None:
+    """建连前放大收发缓冲并禁 Nagle，让 TCP 握手协商大窗口以吸收画面跳转大帧。"""
+    if sock is None:
+        return
+    _set_tcp_nodelay(sock)
+    for opt, size in ((socket.SO_RCVBUF, _TUNNEL_RCVBUF), (socket.SO_SNDBUF, _TUNNEL_SNDBUF)):
+        with contextlib.suppress(OSError, AttributeError):
+            sock.setsockopt(socket.SOL_SOCKET, opt, size)
+
+
+_orig_tunnel_create_connection = tunnel_service.create_connection
+
+
+def _tuned_create_connection(
+    address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **kwargs
+):
+    if kwargs:
+        sock = _orig_tunnel_create_connection(
+            address, timeout=timeout, source_address=source_address, **kwargs
+        )
+        _tune_tunnel_socket(sock)
+        return sock
+    host, port = address
+    err: Optional[OSError] = None
+    for af, socktype, proto, _, sa in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            _tune_tunnel_socket(sock)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            err = exc
+            if sock is not None:
+                sock.close()
+    if err is not None:
+        raise err
+    raise OSError("getaddrinfo returns an empty list")
+
+
+tunnel_service.create_connection = _tuned_create_connection
+
+_orig_tcp_tunnel_sock_read_task = tunnel_service.RemotePairingTcpTunnel.sock_read_task
+
+
+async def _batched_tcp_sock_read_task(self) -> None:
+    """无线 TCP 隧道改为大块读入 + 内存切片分包，并放宽 StreamReader 暂停阈值。"""
+    reader = self._reader
+    if reader is None:
+        return await _orig_tcp_tunnel_sock_read_task(self)
+    if getattr(reader, "_limit", 0) < _TUNNEL_RCVBUF:
+        reader._limit = _TUNNEL_RCVBUF
+    hdr_size = tunnel_service.IPV6_HEADER_SIZE
+    lo_hdr = tunnel_service.LOOPBACK_HEADER
+    buf = bytearray()
+    try:
+        while True:
+            chunk = await reader.read(65536)
+            if not chunk:
+                return
+            buf.extend(chunk)
+            offset = 0
+            total = len(buf)
+            view = memoryview(buf)
+            try:
+                while total - offset >= hdr_size:
+                    pkt_len = hdr_size + struct.unpack_from(">H", view, offset + 4)[0]
+                    if total - offset < pkt_len:
+                        break
+                    self.tun.write(lo_hdr + bytes(view[offset : offset + pkt_len]))
+                    offset += pkt_len
+            finally:
+                view.release()
+            if offset:
+                del buf[:offset]
+    except (asyncio.IncompleteReadError, ConnectionTerminatedError):
+        return
+    except OSError as exc:
+        self._logger.warning(f"got {exc.__class__.__name__} in sock_read_task")
+        return
+
+
+tunnel_service.RemotePairingTcpTunnel.sock_read_task = _batched_tcp_sock_read_task
+
+
 async def _attempt_remote_endpoint(
     udid: str, host: str, port: int, timeout: float, autopair: bool = False, *, adopt_record: bool = False,
 ):
@@ -361,6 +460,8 @@ async def _attempt_remote_endpoint(
                 await candidate.connect(autopair=False)
             if autopair and not hasattr(candidate, "client_cip"):
                 raise NotPairedError("无线配对未通过验证")
+            writer = getattr(candidate, "_writer", None)
+            _set_tcp_nodelay(writer.get_extra_info("socket") if writer is not None else None)
         except BaseException:
             with contextlib.suppress(Exception):
                 await candidate.close()
@@ -809,30 +910,35 @@ def _scroll_report(dx: int, dy: int, phase: int, momentum: int = 0) -> bytes:
 
 
 class _CorsWriter:
-    """代理 StreamWriter：在首个 HTTP 响应头里补 CORS，允许浏览器引擎
-    Worker 跨端口直读本进程的流响应；其余调用原样转发。"""
+    """代理 StreamWriter：给每条 HTTP 响应头补 CORS（含 keep-alive 复用连接），
+    允许浏览器跨端口直连本进程的流与控制接口；其余调用原样转发。"""
 
-    __slots__ = ("_inner", "_head_done")
+    __slots__ = ("_inner",)
 
     def __init__(self, inner: asyncio.StreamWriter) -> None:
         self._inner = inner
-        self._head_done = False
 
     def write(self, data: bytes) -> None:
-        if not self._head_done:
-            self._head_done = True
-            if data[:8] == b"HTTP/1.1":
-                head, sep, rest = data.partition(b"\r\n\r\n")
-                if sep:
-                    return self._inner.write(head + b"\r\nAccess-Control-Allow-Origin: *" + sep + rest)
+        if data[:9] == b"HTTP/1.1 ":
+            head, sep, rest = data.partition(b"\r\n\r\n")
+            if sep:
+                return self._inner.write(head + b"\r\nAccess-Control-Allow-Origin: *" + sep + rest)
         return self._inner.write(data)
 
     def __getattr__(self, name: str):
         return getattr(self._inner, name)
 
 
+def _touch_op(body: bytes) -> str:
+    try:
+        return str(json.loads(body).get("type", ""))
+    except Exception:
+        return ""
+
+
 class MirrorScreenStreamServer(ScreenStreamServer):
     _scroll_active = False
+    _touch_down = False
     _scroll_end_handle = None
     # 键盘走独立 UHS 连接：点画面时只关这一条，触摸那条完全不受影响。
     _kb_uhs = None
@@ -844,6 +950,13 @@ class MirrorScreenStreamServer(ScreenStreamServer):
     _hid_ok_at = 0.0
     # 后台探活任务：同一时间只跑一个。
     _hid_check = None
+    _HID_KEEPALIVE_INTERVAL = 4.0
+
+    async def _ensure_hid(self) -> None:
+        had_link = self._uhs is not None and self._indigo is not None
+        await super()._ensure_hid()
+        if not had_link and self._uhs is not None:
+            self._hid_ok_at = asyncio.get_running_loop().time()
 
     async def _hid_alive(self) -> bool:
         """一次真实 RPC 探活：HID 发送本身不等响应，死链必须靠请求-响应探出来。"""
@@ -857,20 +970,90 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             return False
 
     async def _ensure_hid_ready(self) -> None:
-        """链路闲置一段时间后先探活再发输入，死链当场重建。
+        """链路闲置过久且保活未覆盖时先探活再发输入，死链当场重建。
 
         send_report 是发射后不管：写进断掉的连接不会抛错，只会静默丢报告，
         表现就是「画面正常但点击无效」。只有 list_connected_services 这种
         等响应的调用能探出死链。
         """
-        loop = asyncio.get_running_loop()
-        if loop.time() - self._hid_ok_at < 1.5:
+        if self._uhs is None:
             return
-        self._hid_ok_at = loop.time()
-        if not await self._hid_alive():
-            logging.warning("hid link dead (ping failed), rebuilding")
+        loop = asyncio.get_running_loop()
+        if loop.time() - self._hid_ok_at < self._HID_KEEPALIVE_INTERVAL + 1.0:
+            return
+        if await self._hid_alive():
+            self._hid_ok_at = loop.time()
+            return
+        logging.warning("hid link dead (ping failed), rebuilding")
+        async with self._hid_lock:
+            await self._reset_hid()
+
+    async def _hid_keepalive_loop(self) -> None:
+        """闲置期定期探活并预重建 HID 链路，避免久未点击回来首下卡住或丢点击。"""
+        loop = asyncio.get_running_loop()
+        while True:
+            await asyncio.sleep(self._HID_KEEPALIVE_INTERVAL)
+            if self._hid_check is not None and not self._hid_check.done():
+                continue
+            if self._uhs is None:
+                if getattr(self, "_active_service", None) is not None:
+                    with contextlib.suppress(Exception):
+                        await self._ensure_hid()
+                continue
+            if loop.time() - self._hid_ok_at < self._HID_KEEPALIVE_INTERVAL:
+                continue
+            if await self._hid_alive():
+                self._hid_ok_at = loop.time()
+                continue
+            logging.warning("hid link dead while idle, rebuilding")
             async with self._hid_lock:
                 await self._reset_hid()
+            with contextlib.suppress(Exception):
+                await self._ensure_hid()
+
+    async def _needs_key_retry_loop(self) -> None:
+        """motion_idr 关闭时兜底补发丢包后的关键帧请求：单次卡住最多补 2 次，避免漏理 PLI 冻满 8 秒。"""
+        loop = asyncio.get_running_loop()
+        retries: dict[tuple[int, float], int] = {}
+        while True:
+            await asyncio.sleep(0.4)
+            if self._active_service is None or self._rtcp_dest is None:
+                retries.clear()
+                continue
+            now = loop.time()
+            active_keys: set[tuple[int, float]] = set()
+            need_retry = False
+            for state in list(self._subscribers.values()):
+                if not state.needs_key or state.reset_on_key:
+                    continue
+                key = (id(state), state.needs_key_since)
+                active_keys.add(key)
+                if now - state.needs_key_since < 0.8:
+                    continue
+                if retries.get(key, 0) < 2:
+                    need_retry = True
+            for key in list(retries):
+                if key not in active_keys:
+                    retries.pop(key, None)
+            if need_retry and now - self._last_refresh_t >= 1.0:
+                self._request_recovery_idr(reason="needs-key-retry")
+                for key in active_keys:
+                    if retries.get(key, 0) < 2:
+                        retries[key] = retries.get(key, 0) + 1
+
+    async def serve(self) -> None:
+        tasks = [
+            asyncio.create_task(self._hid_keepalive_loop()),
+            asyncio.create_task(self._needs_key_retry_loop()),
+        ]
+        try:
+            await super().serve()
+        finally:
+            for task in tasks:
+                task.cancel()
+            for task in tasks:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     def _hid_kick(self) -> None:
         """输入发出后顺手探活，链路死掉时在下一次输入前完成重建。
@@ -880,7 +1063,6 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         loop = asyncio.get_running_loop()
         if loop.time() - self._hid_ok_at < 2.0:
             return
-        self._hid_ok_at = loop.time()
         if self._hid_check is not None and not self._hid_check.done():
             return
         self._hid_check = asyncio.create_task(self._hid_verify())
@@ -891,6 +1073,7 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             return
         try:
             await asyncio.wait_for(uhs.list_connected_services(), 1.0)
+            self._hid_ok_at = asyncio.get_running_loop().time()
             return
         except Exception:
             pass
@@ -916,7 +1099,32 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         return super()._refuse_request(headers)
 
     async def _handle_http(self, reader, writer) -> None:
+        _set_tcp_nodelay(writer.get_extra_info("socket"))
         await super()._handle_http(reader, _CorsWriter(writer))
+
+    async def _audio_rtcp_send_loop(self, transport) -> None:
+        """发送音频 RTCP RR 保活：单次 UDP 失败不退出循环，避免 20s 后设备回收音频会话。"""
+        while self._audio_sock is transport:
+            await asyncio.sleep(1.0)
+            if self._audio_sock is not transport or self._audio_rtcp_dest is None:
+                continue
+            try:
+                await transport.sendto(self._build_audio_rtcp_rr(), *self._audio_rtcp_dest)
+            except OSError as exc:
+                logging.debug("audio RTCP send failed (%s); keeping loop alive", exc)
+
+    async def _audio_udp_recv(self, transport) -> None:
+        try:
+            await super()._audio_udp_recv(transport)
+        finally:
+            # 接收任务在流仍活跃时意外退出：发空块唤醒 /audio.bin 订阅端重连重建。
+            if self._audio_sock is transport:
+                for q in list(self._audio_subscribers.keys()):
+                    if q.full():
+                        with contextlib.suppress(asyncio.QueueEmpty):
+                            q.get_nowait()
+                    with contextlib.suppress(asyncio.QueueFull):
+                        q.put_nowait(b"")
 
     async def _ensure_keyboard(self) -> None:
         """在独立连接上注册宿主虚拟键盘。
@@ -978,13 +1186,23 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         indigo, self._indigo = self._indigo, None
         self._touch_service_id = None
         self._scroll_active = False
+        self._touch_down = False
+        self._hid_ok_at = 0.0
         for service in (uhs, indigo):
             if service is not None:
                 with contextlib.suppress(Exception):
                     await service.close()
 
     async def _handle_touch(self, body: bytes) -> tuple[int, bytes]:
-        await self._ensure_hid_ready()
+        op = _touch_op(body)
+        # 拖动中合并队列里连续积压的 contact 坐标，只发最新点，不丢起手和抬手。
+        if self._touch_down and op == "contact":
+            queue = getattr(self, "_hid_queue", None)
+            buf = getattr(queue, "_queue", None)
+            while buf and buf[0][0] == "/touch" and _touch_op(buf[0][1]) == "contact":
+                body = queue.get_nowait()[1]
+        if not self._touch_down and op != "release":
+            await self._ensure_hid_ready()
         try:
             result = await super()._handle_touch(body)
         except Exception:
@@ -992,6 +1210,10 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             async with self._hid_lock:
                 await self._reset_hid()
             result = await super()._handle_touch(body)
+        if op == "contact":
+            self._touch_down = True
+        elif op in ("release", "tap"):
+            self._touch_down = False
         # 发送后探活：死链在下一次输入到达前完成重建。
         self._hid_kick()
         return result
@@ -1099,6 +1321,8 @@ class MirrorScreenStreamServer(ScreenStreamServer):
 
     async def _stop_hid(self) -> None:
         self._scroll_active = False
+        self._touch_down = False
+        self._hid_ok_at = 0.0
         if self._motion_task is not None:
             self._motion_task.cancel()
             self._motion_task = None
@@ -1158,6 +1382,29 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                 return 503, b"keyboard unavailable"
             await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
         return 200, b"ok"
+
+
+# 首帧起流后延后学习无线地址，避开开流和 HID 预热窗口。
+_WIRELESS_LEARN_DELAY = 15.0
+
+
+async def _learn_wireless_after_delay(udid: str, delay: float = _WIRELESS_LEARN_DELAY) -> None:
+    """已无线配对的设备在 USB 会话稳定后再后台刷新 Wi-Fi 地址，避免首帧期 PcapdService 争抢资源。"""
+    record = pmd_pair_records.get_local_pairing_record(
+        pmd_pair_records.get_remote_pairing_record_filename(udid), _PMD_HOME
+    )
+    if not record:
+        return
+    await asyncio.sleep(delay)
+    with contextlib.suppress(Exception):
+        address_lockdown = await create_using_usbmux(serial=udid, autopair=False)
+        try:
+            learned = await _learn_wireless_address(address_lockdown) or await _discover_wireless_address(udid)
+        finally:
+            with contextlib.suppress(Exception):
+                await address_lockdown.close()
+        if learned:
+            _emit({"type": "wireless-address", "udid": udid, "host": learned[0], "port": learned[1]})
 
 
 async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "", *, explicit_host: bool = False) -> int:
@@ -1228,24 +1475,15 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "", *, exp
                 await server._ensure_hid()
 
         hid_warm = asyncio.create_task(warm_hid())
+        address_task = asyncio.create_task(_learn_wireless_after_delay(udid)) if not wireless else None
 
-        # USB 会话期间学习手机 Wi-Fi 地址，供拔线后的无线直连使用。
-        async def report_wireless_address() -> None:
-            with contextlib.suppress(Exception):
-                address_lockdown = await create_using_usbmux(serial=udid, autopair=False)
-                try:
-                    learned = await _learn_wireless_address(address_lockdown) or await _discover_wireless_address(udid)
-                finally:
-                    with contextlib.suppress(Exception):
-                        await address_lockdown.close()
-                if learned:
-                    _emit({"type": "wireless-address", "udid": udid, "host": learned[0], "port": learned[1]})
-
-        if not wireless:
-            asyncio.create_task(report_wireless_address())
         if os.environ.get("PHONE_MIRROR_STDIN_QUIT") != "1" or sys.stdin is None:
-            await serve_task
-            hid_warm.cancel()
+            try:
+                await serve_task
+            finally:
+                hid_warm.cancel()
+                if address_task is not None:
+                    address_task.cancel()
             return 0
 
         stop = asyncio.Event()
@@ -1293,6 +1531,8 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "", *, exp
         finally:
             stall_task.cancel()
             hid_warm.cancel()
+            if address_task is not None:
+                address_task.cancel()
             stop_wait.cancel()
             stdin_task.cancel()
             serve_task.cancel()

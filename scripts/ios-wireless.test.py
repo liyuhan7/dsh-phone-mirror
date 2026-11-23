@@ -591,6 +591,290 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(0x01, phases, phases)
         self.assertIn(0x02, phases, phases)
 
+    async def test_http_handler_enables_tcp_nodelay(self):
+        import socket as _socket
+
+        sock = SimpleNamespace(setsockopt=unittest.mock.MagicMock())
+        writer = SimpleNamespace(get_extra_info=lambda key: sock if key == "socket" else None)
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        with patch.object(bridge.ScreenStreamServer, "_handle_http", AsyncMock()) as parent_handle:
+            await server._handle_http("reader", writer)
+        sock.setsockopt.assert_called_once_with(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        parent_handle.assert_awaited_once()
+        self.assertIsInstance(parent_handle.await_args.args[1], bridge._CorsWriter)
+
+    async def test_deferred_wireless_address_skips_unpaired_and_delays_paired(self):
+        lockdown = SimpleNamespace(close=AsyncMock())
+        emitted = []
+        with (
+            patch.object(bridge.pmd_pair_records, "get_local_pairing_record", return_value=None),
+            patch.object(bridge, "create_using_usbmux", AsyncMock()) as mux,
+        ):
+            await bridge._learn_wireless_after_delay("unpaired-udid", delay=0.01)
+        mux.assert_not_awaited()
+
+        sleep_calls = []
+
+        async def fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        with (
+            patch.object(bridge.pmd_pair_records, "get_local_pairing_record", return_value={"peer_alt_irk": b"x" * 16}),
+            patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep),
+            patch.object(bridge, "create_using_usbmux", AsyncMock(return_value=lockdown)),
+            patch.object(bridge, "_learn_wireless_address", AsyncMock(return_value=("192.0.2.8", 49152))),
+            patch.object(bridge, "_emit", side_effect=emitted.append),
+        ):
+            await bridge._learn_wireless_after_delay("paired-udid", delay=15.0)
+        self.assertEqual(sleep_calls, [15.0])
+        lockdown.close.assert_awaited_once()
+        self.assertEqual(emitted, [{"type": "wireless-address", "udid": "paired-udid", "host": "192.0.2.8", "port": 49152}])
+
+    async def test_audio_rtcp_and_udp_recovery_hooks(self):
+        transport = SimpleNamespace(sendto=AsyncMock(side_effect=[OSError("transient"), None]))
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._audio_sock = transport
+        server._audio_rtcp_dest = ("fd00::1", 5000)
+        server._build_audio_rtcp_rr = lambda: b"rr"
+
+        sleep_calls = 0
+
+        async def fake_sleep(_):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls >= 3:
+                server._audio_sock = None
+
+        with patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep):
+            await server._audio_rtcp_send_loop(transport)
+        self.assertEqual(transport.sendto.await_count, 2)
+
+        q = asyncio.Queue(maxsize=1)
+        q.put_nowait(b"old")
+        server._audio_sock = transport
+        server._audio_subscribers = {q: None}
+        with patch.object(bridge.ScreenStreamServer, "_audio_udp_recv", AsyncMock(return_value=None)):
+            await server._audio_udp_recv(transport)
+        self.assertEqual(q.get_nowait(), b"")
+
+    async def test_hid_keepalive_rebuilds_dead_link_and_avoids_inline_ping(self):
+        from types import MethodType
+
+        dead_uhs = SimpleNamespace(close=AsyncMock())
+        fresh_uhs = SimpleNamespace(list_connected_services=AsyncMock(return_value={}))
+        holder = SimpleNamespace(
+            _uhs=dead_uhs,
+            _indigo=SimpleNamespace(close=AsyncMock()),
+            _active_service=object(),
+            _touch_service_id=257,
+            _scroll_active=False,
+            _hid_ok_at=-100.0,
+            _hid_check=None,
+            _hid_lock=asyncio.Lock(),
+            _HID_KEEPALIVE_INTERVAL=4.0,
+        )
+        holder._hid_alive = AsyncMock(return_value=False)
+        holder._reset_hid = MethodType(bridge.MirrorScreenStreamServer._reset_hid, holder)
+
+        async def ensure_hid():
+            holder._uhs = fresh_uhs
+            holder._hid_ok_at = asyncio.get_running_loop().time()
+
+        holder._ensure_hid = ensure_hid
+        holder._ensure_hid_ready = MethodType(bridge.MirrorScreenStreamServer._ensure_hid_ready, holder)
+
+        slept = 0
+
+        async def fake_sleep(_):
+            nonlocal slept
+            slept += 1
+            if slept >= 2:
+                raise asyncio.CancelledError()
+
+        with patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await bridge.MirrorScreenStreamServer._hid_keepalive_loop(holder)
+
+        dead_uhs.close.assert_awaited_once()
+        self.assertIs(holder._uhs, fresh_uhs)
+
+        # 保活刚验证过的链路，首下点击不再同步等 RPC 探活。
+        holder._hid_alive.reset_mock()
+        await holder._ensure_hid_ready()
+        holder._hid_alive.assert_not_awaited()
+
+        # 探活失败后 _reset_hid 必须清零时间戳；即使后续保活重连失败，也不会留下假健康时间戳。
+        await holder._reset_hid()
+        self.assertEqual(holder._hid_ok_at, 0.0)
+        holder._uhs = dead_uhs
+        holder._hid_ok_at = -100.0
+        holder._hid_alive = AsyncMock(return_value=False)
+        holder._ensure_hid = AsyncMock(side_effect=OSError("down"))
+        slept = 0
+        with patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await bridge.MirrorScreenStreamServer._hid_keepalive_loop(holder)
+        self.assertIsNone(holder._uhs)
+        self.assertEqual(holder._hid_ok_at, 0.0)
+
+        # 流重启清空 HID 后，保活在有活跃流时会在闲置期主动预连。
+        rebuilt = AsyncMock()
+        holder._ensure_hid = rebuilt
+        slept = 0
+        with patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await bridge.MirrorScreenStreamServer._hid_keepalive_loop(holder)
+        rebuilt.assert_awaited_once()
+
+    async def test_tunnel_create_connection_sets_tcp_nodelay(self):
+        import socket as _socket
+
+        events = []
+
+        class FakeSock:
+            def setsockopt(self, level, opt, val):
+                events.append(("opt", level, opt, val))
+
+            def settimeout(self, t):
+                events.append(("timeout", t))
+
+            def connect(self, sa):
+                events.append(("connect", sa))
+
+            def close(self):
+                events.append(("close",))
+
+        fake = FakeSock()
+        addrinfo = [(_socket.AF_INET, _socket.SOCK_STREAM, 0, "", ("192.0.2.2", 59586))]
+        with (
+            patch.object(bridge.socket, "getaddrinfo", return_value=addrinfo),
+            patch.object(bridge.socket, "socket", return_value=fake),
+        ):
+            res = bridge.tunnel_service.create_connection(("192.0.2.2", 59586), timeout=2.5)
+        self.assertIs(res, fake)
+        connect_idx = events.index(("connect", ("192.0.2.2", 59586)))
+        pre_opts = events[:connect_idx]
+        self.assertIn(("opt", _socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1), pre_opts)
+        self.assertIn(("opt", _socket.SOL_SOCKET, _socket.SO_RCVBUF, bridge._TUNNEL_RCVBUF), pre_opts)
+        self.assertIn(("opt", _socket.SOL_SOCKET, _socket.SO_SNDBUF, bridge._TUNNEL_SNDBUF), pre_opts)
+        self.assertIn(("timeout", 2.5), pre_opts)
+
+    async def test_batched_tcp_sock_read_task_parses_split_and_merged_ipv6_packets(self):
+        import struct as _struct
+
+        def make_ipv6(payload: bytes) -> bytes:
+            return b"\x60\x00\x00\x00" + _struct.pack(">H", len(payload)) + b"\x11\x40" + b"\x00" * 32 + payload
+
+        pkt1 = make_ipv6(b"alpha")
+        pkt2 = make_ipv6(b"beta-second")
+        wire = pkt1 + pkt2
+        chunks = [wire[: len(pkt1) + 12], wire[len(pkt1) + 12 :], b""]
+
+        class FakeReader:
+            _limit = 65536
+
+            async def read(self, _n):
+                return chunks.pop(0)
+
+        written = []
+        tunnel = SimpleNamespace(
+            _reader=FakeReader(),
+            _service=None,
+            _logger=SimpleNamespace(warning=lambda *a, **k: None),
+            tun=SimpleNamespace(write=written.append),
+        )
+        await bridge.tunnel_service.RemotePairingTcpTunnel.sock_read_task(tunnel)
+        self.assertEqual(tunnel._reader._limit, bridge._TUNNEL_RCVBUF)
+        lo = bridge.tunnel_service.LOOPBACK_HEADER
+        self.assertEqual(written, [lo + pkt1, lo + pkt2])
+
+    async def test_cors_writer_adds_header_to_every_keepalive_response(self):
+        written = []
+        writer = bridge._CorsWriter(SimpleNamespace(write=written.append))
+        resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        writer.write(resp)
+        writer.write(resp)
+        writer.write(b"2\r\nok\r\n")
+        self.assertEqual(written[0].count(b"Access-Control-Allow-Origin: *"), 1)
+        self.assertEqual(written[1].count(b"Access-Control-Allow-Origin: *"), 1)
+        self.assertEqual(written[2], b"2\r\nok\r\n")
+
+    async def test_handle_touch_coalesces_drag_moves_and_skips_mid_drag_probe(self):
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._touch_down = False
+        server._hid_queue = asyncio.Queue()
+        server._ensure_hid_ready = AsyncMock()
+        server._hid_kick = lambda: None
+        server._hid_lock = asyncio.Lock()
+        sent = []
+
+        async def parent_touch(_self, body):
+            sent.append(bridge.json.loads(body))
+            return 200, b"ok"
+
+        def touch_body(op, x, y):
+            return bridge.json.dumps({"type": op, "x": x, "y": y}).encode()
+
+        with patch.object(bridge.ScreenStreamServer, "_handle_touch", parent_touch):
+            # 起手 down：不合并后续拖动点，只探活一次。
+            server._hid_queue.put_nowait(("/touch", touch_body("contact", 2, 2)))
+            await server._handle_touch(touch_body("contact", 1, 1))
+            self.assertTrue(server._touch_down)
+            self.assertEqual(sent, [{"type": "contact", "x": 1, "y": 1}])
+            server._ensure_hid_ready.assert_awaited_once()
+
+            # 拖动中连续积压多个 contact 后接 release：只发最新 contact，保留 release，且不再同步探活。
+            server._hid_queue.put_nowait(("/touch", touch_body("contact", 3, 3)))
+            server._hid_queue.put_nowait(("/touch", touch_body("contact", 4, 4)))
+            server._hid_queue.put_nowait(("/touch", touch_body("release", 4, 4)))
+            first_drag = server._hid_queue.get_nowait()[1]
+            await server._handle_touch(first_drag)
+            self.assertEqual(sent[-1], {"type": "contact", "x": 4, "y": 4})
+            self.assertEqual(server._hid_queue.qsize(), 1)
+            server._ensure_hid_ready.assert_awaited_once()
+
+            # 抬手 release：复位按下态，不做同步探活。
+            release = server._hid_queue.get_nowait()[1]
+            await server._handle_touch(release)
+            self.assertFalse(server._touch_down)
+            self.assertEqual(sent[-1], {"type": "release", "x": 4, "y": 4})
+            server._ensure_hid_ready.assert_awaited_once()
+
+    async def test_needs_key_retry_loop_caps_at_two_plis_per_stall(self):
+        now = 100.0
+        sub_state = SimpleNamespace(needs_key=True, reset_on_key=False, needs_key_since=99.0)
+        bootstrap_state = SimpleNamespace(needs_key=True, reset_on_key=True, needs_key_since=90.0)
+        plis = []
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._active_service = object()
+        server._rtcp_dest = ("fd00::1", 5000)
+        server._last_refresh_t = 98.0
+        server._subscribers = {object(): sub_state, object(): bootstrap_state}
+
+        def req_idr(*, reason):
+            plis.append(reason)
+            server._last_refresh_t = now
+
+        server._request_recovery_idr = req_idr
+        ticks = 0
+
+        async def fake_sleep(_):
+            nonlocal ticks, now
+            ticks += 1
+            now += 1.2
+            if ticks >= 5:
+                raise asyncio.CancelledError()
+
+        fake_loop = SimpleNamespace(time=lambda: now)
+        with (
+            patch.object(bridge.asyncio, "get_running_loop", return_value=fake_loop),
+            patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await server._needs_key_retry_loop()
+        # 同一次 needs_key 定格最多补发 2 次，不会引发 PLI 风暴。
+        self.assertEqual(plis, ["needs-key-retry", "needs-key-retry"])
+
 
 if __name__ == "__main__":
     unittest.main()

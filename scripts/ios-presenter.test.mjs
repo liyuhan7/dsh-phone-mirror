@@ -333,14 +333,15 @@ test('reopening resets the transform before clearing the canvas', async () => {
   engine.handle({ type: 'close' })
 })
 
-// 媒体管线：解码帧写进 video 轨道，画布完全不参与，并能上报几何供主线程摆放。
+// 媒体管线：解码帧写进 video 轨道，按 4 帧队列 + 16ms 节拍匀出，画布完全不参与。
 test('iOS decoded frames go to a video track instead of the canvas', async () => {
   const blits = []
   const written = []
   const messages = []
   const decoded = []
-  // 挡一下背压：写入端说“排满了”时引擎应该丢帧而不是排队。
+  // 模拟背压：队列最多保留最新 4 帧，超出的最旧帧立刻释放，解除后按序匀出。
   let congested = false
+  let readyResolve = null
   let controller
   const canvas = { width: 300, height: 150, getContext: () => ({
     fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}, setTransform() {},
@@ -363,6 +364,10 @@ test('iOS decoded frames go to a video track instead of the canvas', async () =>
         this.writable = {
           getWriter: () => ({
             get desiredSize() { return congested ? 0 : 2 },
+            get ready() {
+              if (!congested) return Promise.resolve()
+              return new Promise((resolve) => { readyResolve = resolve })
+            },
             write: (frame) => { written.push(frame.id); return Promise.resolve() },
             close: () => Promise.resolve()
           })
@@ -387,13 +392,21 @@ test('iOS decoded frames go to a video track instead of the canvas', async () =>
   })
   const send = (...frames) => controller.enqueue(Buffer.concat(frames))
   const video = (id, flags = 0) => frame(KIND.VIDEO, videoPayload(flags, id, Buffer.of(id)))
+  const waitFor = async (count) => {
+    for (let i = 0; i < 60 && written.length < count; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
   engine.handle({ type: 'open', streamUrl: '/video' })
   try {
     send(frame(KIND.META, Buffer.from(JSON.stringify({
       type: 'meta', platform: 'ios', screen: { width: 1290, height: 2796 },
       videoCodec: 'hvc1.test', videoDescription: 'AA=='
     }))), video(1, VIDEO_FLAGS.KEY), video(2))
-    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve))
+    for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve))
+    // 突发连到两帧：第 1 帧立刻写出，第 2 帧按 16ms 节拍匀出而非同步连写。
+    assert.deepEqual(written, [1])
+    await waitFor(2)
 
     const track = messages.find((entry) => entry.message.type === 'track')
     assert.ok(track, '没有把轨道传给主线程')
@@ -405,12 +418,18 @@ test('iOS decoded frames go to a video track instead of the canvas', async () =>
     const geometry = messages.filter((entry) => entry.message.type === 'geometry').at(-1).message
     assert.deepEqual([geometry.width, geometry.height, geometry.rotation], [1290, 2796, 0])
 
-    // 排满了就丢帧：不写进轨道，并且立刻释放帧。
+    // 排满期间连发 5 帧：队列上限 4，最旧的 3 被立刻释放，保留 4..7。
     congested = true
-    send(video(3))
-    for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setImmediate(resolve))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    send(video(3), video(4), video(5), video(6), video(7))
+    for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve))
     assert.deepEqual(written, [1, 2])
-    assert.equal(decoded.at(-1).closed, 1)
+    assert.deepEqual(decoded.slice(2).map((f) => f.closed), [1, 0, 0, 0, 0])
+
+    congested = false
+    readyResolve?.()
+    await waitFor(6)
+    assert.deepEqual(written, [1, 2, 4, 5, 6, 7])
   } finally {
     engine.handle({ type: 'close' })
   }
