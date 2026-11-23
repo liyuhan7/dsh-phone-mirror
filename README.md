@@ -5,102 +5,87 @@
 [![CI](https://github.com/liyuhan7/dsh-phone-mirror/actions/workflows/ci.yml/badge.svg)](https://github.com/liyuhan7/dsh-phone-mirror/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-用 agent 干活的时候，手机就在侧边栏：刷视频、回消息、看通知都不用离开电脑，省掉反复拿起放下的步骤。画面与声音实时转发，鼠标键盘直接操作设备。
+在 DSH 侧边栏里实时投屏并反控手机：回消息、看通知、刷视频都不用离开电脑。支持画面与声音同步转发，鼠标键盘直接操作设备。
 
-两条独立的设备路径：
+两条独立设备链路：
 
-- **安卓**：scrcpy 5.0.1（H.264 + Opus）加浏览器端 WebCodecs；scrcpy 起不来时自动降级为 `adb screencap` 周期截图。
-- **iPhone / iPad（iOS 27+）**：CoreDevice `DisplayService`（HEVC `hvcC` + AAC-ELD 48 kHz 立体声）加隧道 HID 反控，无需越狱，无需在手机端安装 App。
+- **安卓**：scrcpy 5.0.1（H.264 + Opus）+ 浏览器 WebCodecs；scrcpy 启动失败时自动降级为 `adb screencap` 轮询截图。
+- **iPhone / iPad（iOS 27+）**：CoreDevice `DisplayService`（HEVC `hvcC` + AAC-ELD 48 kHz 立体声）+ 隧道 HID 反控，无需越狱，无需在手机端安装 App。
 
 ![页面示例](docs/example.png)
 
-## 功能
+## 核心能力
 
-- **页签常驻右侧栏**：在「+」里添加「手机」页签即可投屏，画面按 contain 比例铺满；收起侧栏或切到别的页签时暂停音视频传输但保留设备连接，切回来从实时关键帧继续；切换 DSH 会话时侧栏展开则手机页签跟随并共用同一条连接；关闭最后一个手机页签才断开连接并释放设备端会话。
-- **鼠标键盘反控**：点按、拖拽、滚轮按设备协议回传；键盘按外接键盘逐键转发，iOS 上拼音由手机的输入法组字、数字/空格/回车选字，安卓上中文以剪贴板粘贴注入。
-- **声音一起转发**：安卓走 Opus 48 kHz 立体声，iOS 走 AAC-ELD 48 kHz 立体声，经 AudioWorklet 环形缓冲播放；设备或本机不支持时降级为无声会话。
-- **解码在 Worker 线程**：拉流、视频解码、绘制与音频解码都在 Worker 内完成，DSH 主线程渲染对话或写文件时面板不跟着卡；拿不到 Worker 时退回主线程。
-- **安卓自动降级**：scrcpy 失败后用 `adb screencap` 截图，帧率低但几乎任何能 adb 的设备都能出画面。
-- **一根线到无线**：面板底部的「转无线」把连接切到局域网；安卓切 USB 调试到 TCP 并自动连上，iOS 完成无线配对并记住手机地址，拔线后再点「连接」。
+- **侧边栏常驻与会话共享**：在右侧栏「+」添加「手机」页签即可投屏。收起侧栏或切到其他页签时暂停媒体传输但保留设备连接，切回后从实时关键帧恢复；切换 DSH 对话时跟随展示并共用同一连接；关闭最后一个手机页签才释放设备会话。
+- **低延迟独立媒体链路**：解码在 Worker 线程运行，避免被 DSH 主线程对话渲染阻塞。iOS 侧视频、音频、触控与滚轮均直连本地 sidecar，画面优先走浏览器媒体管线（`VideoTrackGenerator` → `<video>`）渲染，sidecar 入站媒体 UDP 旁路用户态协议栈并自动隔离系统代理。
+- **鼠标与键盘反控**：支持点按、长按、拖拽与滚轮。键盘逐键下发——iOS 切英文后直接敲拼音，由手机输入法组字并显示候选条；安卓英文数字逐键注入，中文经剪贴板粘贴上屏。
+- **同步声音转发**：安卓为 Opus 48 kHz 立体声，iOS 为 AAC-ELD 48 kHz 立体声，经 AudioWorklet 环形缓冲与平滑交叉淡化播放；无线会话自动抬高缓冲水位以吸收网络抖动；不支持时自动降级为无声。
+- **有线一键转无线**：安卓通过「转无线」切到 TCP 并自动连接（Android 11+ 也支持无线调试配对）；iOS 通过「转无线」在 USB 下完成无线配对与地址学习，也支持「手填地址」直连未配对或跨网段可见的设备。
 
 ## 环境要求
 
-| 项目 | 说明 |
+| 项目 | 要求 |
 | --- | --- |
 | DSH | `>= 0.2.0-rc.1 < 0.3.0` |
-| Node.js | 20+，仅首次下载工具与构建时使用 |
-| 电脑系统 | Windows 为主要验证平台；macOS / Linux 会下载对应平台的 platform-tools，iOS 还需本机 usbmuxd 可用 |
-| 安卓设备 | 开发者选项 → USB 调试已开启并授权；转发声音需要 Android 11+ |
-| iPhone / iPad | **iOS 27+**，Windows 已安装 Apple Devices 或 iTunes，手机已开启开发者模式；iOS 运行时随插件提供，无需安装 Python |
+| Node.js | 20+（仅首次准备工具或本地构建时需要） |
+| 电脑系统 | Windows 为主要验证平台；macOS / Linux 按平台下载 `platform-tools`，iOS 需本机 `usbmuxd` 可用 |
+| 安卓设备 | 已开启并授权 USB 调试；音频转发需要 Android 11+ |
+| iPhone / iPad | **iOS 27+**，已开启开发者模式；Windows 需安装 Apple Devices 或 iTunes，iOS 运行时随插件提供，无需手动装 Python |
 
-各品牌安卓机开启 USB 调试的入口和额外开关见 [docs/debugging.md](docs/debugging.md)。
+各品牌安卓开启 USB 调试的入口与额外开关见 [docs/debugging.md](docs/debugging.md)。
 
 ## 安装
 
 ```bash
-# npm 包，预构建安装
+# 从 npm 安装（推荐，含预构建产物）
 dsh plugin --profile <profile> add dsh-phone-mirror
-# 或从仓库安装
+
+# 或从 GitHub 仓库安装
 dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
 ```
 
 首次运行按需自动准备依赖：
 
-- **安卓**：下载 `platform-tools`（约 8 MB）到插件目录，也可手动执行 `npm run fetch:tools`；系统里已有 adb 时在配置里指定 `adbPath` 跳过下载。
-- **iOS**：Windows x64 的 iOS 运行时（可移植 Python + `pymobiledevice3` + `PyAV`，压缩后约 100 MB）通过 npm 可选依赖安装。平台包缺失或被跳过时，首次连接会自动从 Release 下载到 `~/.dsh/phone-mirror-ios-runtime/`；两条路都不可用才回退到本机 Python 3.11+ 现场安装。
+- **安卓**：下载 `platform-tools`（约 8 MB）到插件目录，也可手动执行 `npm run fetch:tools`，或在配置里设置 `adbPath` 复用系统已有 adb。
+- **iOS**：Windows x64 运行时（嵌入式 Python + `pymobiledevice3` + `PyAV`，压缩包约 100 MB）随 npm 可选依赖安装；缺失或被跳过时首次连接自动从 Release 下载到 `~/.dsh/phone-mirror-ios-runtime/`，都不可用才回退到本机 Python 3.11+。
 
-## 连接设备
+## 快速上手
 
-### 安卓
+### 连接安卓
 
-1. 打开开发者选项里的 USB 调试，插上数据线，设备弹出「允许 USB 调试吗？」时勾选「始终允许」
-2. 重启 DSH，右侧栏点「+」添加「手机」页签
-3. 顶部平台选「安卓」，下拉选中设备，点「连接」
-4. 想摆脱数据线：点面板底部「转无线」，插件读出设备 WLAN 地址、执行 `adb tcpip 5555` 并自动连上，之后可以拔线
+1. 打开「开发者选项 → USB 调试」，插上数据线并在手机弹窗勾选「始终允许」。
+2. 在 DSH 右侧栏点「+」添加「手机」页签，平台选「安卓」，选中设备点「连接」。
+3. 需要无线时点底部「转无线」，插件读取 WLAN 地址、切到 `adb tcpip 5555` 并自动重连，之后可拔线。Android 11+ 也可用「配对」输入无线调试配对地址与 6 位配对码。
 
-原生 Android 11+ 也可以用「配对」走无线调试：填无线调试页上的配对地址与 6 位配对码，配对成功后插件通过 mDNS 找连接端口并自动连上。
+### 连接 iPhone / iPad
 
-### iPhone / iPad
+1. 打开「设置 → 隐私与安全性 → 开发者模式」，按提示重启确认。
+2. 插上数据线解锁手机，弹窗点「信任」并输入锁屏密码。
+3. 在「手机」页签将平台切到「iOS」，选中 `iPhone` 点「连接」（首次连接自动准备运行时并挂载开发者镜像，全程保持亮屏解锁）。
+4. **无线连接**：
+   - **转无线**：保持 USB 连接点「转无线」，等提示地址验证通过后再拔线，然后选中 `iPhone (Wi-Fi)` 点「连接」。
+   - **手填地址**：点「手填地址」输入手机当前 IPv4 直连；未配对过的设备会在手机弹「信任」，确认后自动完成配对并保存记录。
+   - **个人热点**：手机开热点让电脑连上即可直连，体验接近 USB。
 
-1. 打开手机「设置 → 隐私与安全性 → 开发者模式」，按提示重启确认
-2. 用数据线连接电脑并解锁手机，弹窗点「信任」并输入锁屏密码
-3. 右侧栏点「+」添加「手机」页签，顶部平台切到「iOS」，选中 `iPhone` 点「连接」
-4. 无线投屏：保持 USB 连接点「转无线」，等提示无线地址已验证后再拔线，选中 `iPhone (Wi-Fi)` 点「连接」。也可以点「手填地址」输入手机当前的 IPv4 直连；未配对过的设备会在手机上弹「信任」，确认后自动完成配对。手机开个人热点时电脑连上该热点即可，插件会自动学到热点地址。
+完整 iOS 指南、键盘用法与故障排查见 [docs/ios.md](docs/ios.md)。
 
-连接前提、键盘输入、工具栏按钮与故障排查见 [docs/ios.md](docs/ios.md)。
+**连接成功标志**：面板显示实时画面，顶部状态显示 `设备名 · 分辨率 · 实时帧率`（例如 `iPhone · 1290×2796 · 60fps`）。
 
-**预期输出**：面板出现设备画面，标题行显示 `设备名 · 分辨率 · 实时帧率`，例如 `BKY-W10 · 1048×1600 · 30fps`。
+## 面板操作
 
-## 使用面板
-
-### 画面与触控
-
-点按、长按、拖拽直接操作设备，滚轮对应设备滚动。画面发黑或发花时点「重建画面」：丢弃解码器并重新拉流，由设备重发关键帧。点「全屏」铺满窗口，全屏时点「退出全屏」返回。
-
-### 键盘与输入法
-
-- **安卓**：点画面接管键盘，Esc 交还焦点。电脑输入法组字完成后，文本通过剪贴板粘贴到手机当前输入框；英文数字逐键注入。
-- **iOS**：点画面接管键盘，之后逐键转发给手机。把电脑输入法切到英文，直接敲拼音由手机的输入法组字，候选条显示在手机上，用数字、空格或回车选字；Esc 转发给手机，Ctrl+空格 切换中英；改变手机朝向即交还手机软键盘。
-
-### 工具栏
-
-- 安卓：返回、Home、任务、音量-、音量+、电源、旋转、通知、全屏
-- iOS：Home、任务、音量-、音量+、电源、旋转、通知、控制、全屏
-
-按钮语义与 iOS 的下拉手势见 [docs/ios.md](docs/ios.md)。
-
-### 声音与画质
-
-喇叭按钮控制侧栏是否播放设备声音，设备不支持或本机缺少解码器时按钮置灰。画质档位（流畅 720 / 标准 1080 / 高清 1600）只对安卓生效，iOS 按设备原生分辨率出流；切换档位会重连会话。
-
-### 无线连接
-
-- **安卓**：「转无线」把 USB 调试切到 TCP 并自动连上；「配对」用于无线调试；「断开连接」只断开无线通道，不影响 USB 与已建立的会话。
-- **iOS**：「转无线」在 USB 连接下完成配对并记住手机地址；拔线后选中 `iPhone (Wi-Fi)` 连接，掉线会在 90 秒内自动重开；「断开连接」停止无线投屏并把该设备移出列表，配对保留。
+- **画面与触控**：点按、长按、拖拽与滚轮直接操作手机；画面发黑、花屏或卡住时点「重建画面」请求新关键帧；「全屏 / 退出全屏」切换窗口铺满。
+- **键盘输入**：
+  - **安卓**：点画面接管键盘，`Esc` 释放焦点；英文数字逐键发送，中文经剪贴板粘贴。
+  - **iOS**：点画面接管键盘，电脑输入法切英文后直接敲拼音，候选条在手机上显示，用数字 / 空格 / 回车选字；`Esc` 转发给手机，`Ctrl+空格` 切换输入法；转动手机朝向自动交还软键盘。
+- **工具栏**：
+  - 安卓：返回、Home、任务、音量-、音量+、电源、旋转、通知、全屏
+  - iOS：Home、任务、音量-、音量+、电源、旋转、通知、控制、全屏
+- **声音与画质**：喇叭按钮控制播放静音（置灰表示缺少音频流或解码器）；画质档位（流畅 720 / 标准 1080 / 高清 1600）仅对安卓生效，iOS 固定按原生分辨率出流。
+- **无线管理**：iOS 无线掉线会在 90 秒内自动重连；底部「断开连接」会停止无线投屏并将无线条目移出列表，保留配对记录。
 
 ## 配置
 
-在 profile 的 `cordis.patch.yml` 里覆盖：
+在 profile 的 `cordis.patch.yml` 中按需覆盖：
 
 ```yaml
 - id: dsh-phone-mirror
@@ -110,46 +95,39 @@ dsh plugin --profile <profile> add "github:liyuhan7/dsh-phone-mirror"
     videoBitRate: 8000000
 ```
 
-| 字段 | 默认 | 说明 |
+| 字段 | 默认值 | 说明 |
 | --- | --- | --- |
-| `mode` | `auto` | `auto` 先试 scrcpy（音频失败后改无声再试），仍失败才降级截图 |
-| `maxSize` | `1280` | 长边像素上限，可被面板的画质档位覆盖，只对安卓生效 |
-| `maxFps` | `60` | 编码帧率上限 |
-| `videoBitRate` | `8000000` | 编码码率（bps） |
-| `screencapIntervalMs` | `260` | 降级模式的截图间隔 |
-| `audio` | `true` | 转发设备声音；设备不支持时下次直接无声开场 |
-| `adbPath` | 空 | 自定义 adb 路径，留空用插件自带的 |
+| `mode` | `auto` | 安卓模式：`auto` 优先 scrcpy（音频失败自动无声重试），仍失败降级截图 |
+| `maxSize` | `1280` | 长边像素上限，可被面板画质档位覆盖（仅安卓） |
+| `maxFps` | `60` | 编码帧率上限（仅安卓） |
+| `videoBitRate` | `8000000` | 编码码率 bps（仅安卓） |
+| `screencapIntervalMs` | `260` | 安卓截图降级模式的刷新间隔（ms） |
+| `audio` | `true` | 是否转发设备声音；设备不支持时后续自动无声开场 |
+| `adbPath` | 空 | 自定义 adb 可执行文件路径，留空使用插件自带版本 |
 | `serverJar` | 空 | 自定义 `scrcpy-server.jar` 路径 |
-| `iosWirelessHost` | 空 | 手动指定 iPhone 无线地址（如 `10.4.53.159`），优先于 USB 连接时自动学到的地址；留空则使用自动学习的地址 |
+| `iosWirelessHost` | 空 | 手动指定 iPhone 无线 IPv4（如 `10.4.53.159`），优先于自动学习地址 |
 
 ## 常见问题
 
-**`adb devices` 为空，但手机显示已连接**
+**`adb devices` 为空，但手机已插线**
+Windows 可能把接口绑到了厂商驱动（如华为 HDB）。在设备管理器中改为「Android ADB Interface」，或安装 Google USB Driver 后重新指定。
 
-Windows 把该 USB 接口绑到了厂商驱动（例如华为 HDB）。在设备管理器里手动更新为「Android ADB Interface」，或安装 Google USB Driver 后指定。
-
-**`dsh plugin` 拒绝操作 desktop profile**
-
-desktop profile 由 Electron 应用独占托管。直接编辑该 profile 的 `package.json`，在 `dependencies` 里加 `"dsh-phone-mirror": "link:D:/path/to/dsh-phone-mirror"`，并把插件名加进 `dsh.profile.bundles`，然后执行 `pnpm install`。
+**`dsh plugin` 提示无法修改 desktop profile**
+desktop profile 由 Electron 独占管理。直接编辑该 profile 的 `package.json`，在 `dependencies` 添加 `"dsh-phone-mirror": "link:D:/path/to/dsh-phone-mirror"`，将插件名加入 `dsh.profile.bundles` 后运行 `pnpm install`。
 
 **没有声音**
+先看喇叭按钮是否置灰：安卓请查看 `/dsh-phone-mirror/api/status` 中的 `session.audio` 与 `session.audioCodec`；iOS 置灰说明本机缺少 AAC-ELD 解码器。按钮可用仍无声时，检查电脑与手机音量，以及当前 App 是否禁止音频捕获。
 
-安卓先看喇叭按钮：灰色说明这个会话没拿到音频，查 `/dsh-phone-mirror/api/status` 里的 `session.audio` 与 `session.audioCodec`。iOS 的喇叭按钮置灰表示本机缺少 AAC-ELD 解码器。按钮可用却听不到，检查电脑音量、设备是否静音，以及正在播的 App 是否禁止被捕获。
+**iPhone 无线连不上，或校园网无线下画面切页/声音有抖动**
+校园网与企业 Wi-Fi 常屏蔽组播或启用 Proxy ARP / 网关绕行，导致 mDNS 发现失效或无线抖动放大。连不上时可插 USB 刷新自动学习地址或使用「手填地址」；若无线流畅度明显不如 USB，建议改用 **5 GHz 手机个人热点 / 电脑移动热点** 或 **USB 数据线**。详情见 [docs/ios.md](docs/ios.md)。
 
-**iPhone 无线连不上，提示没有收到 RemotePairing 广播**
+**画面发黑或帧率只有个位数**
+安卓 DRM 加密视频（部分付费视频 App）受系统安全通路限制仅输出黑屏；设备画面静止时编码器不发新帧，帧率显示个位数属正常现象。
 
-校园网/企业 AP 常屏蔽客户端之间的组播，而 iOS 的无线发现（以及 Apple Devices 的 Network 发现）都靠 mDNS。插件在 USB 连接期间抓取手机自身出站流量学习它的 Wi-Fi 地址，抓不到时再按配对记录匹配 mDNS 广播兜底；无线连接按学到的地址直连。手机 IP 变化后，可手填 `iosWirelessHost` 覆盖旧地址；也可留空，插回 USB 连一次以刷新自动学习的地址。更多排查见 [docs/ios.md](docs/ios.md)。
+## 文档与许可
 
-**画面发黑，或帧率只有个位数**
+- [docs/ios.md](docs/ios.md)：iPhone / iPad 连接、直连传输说明、无线建议与故障排查
+- [docs/debugging.md](docs/debugging.md)：各品牌安卓开启 USB 调试与无线调试
+- [THIRD-PARTY.md](THIRD-PARTY.md)：第三方组件与许可说明
 
-安卓上付费视频等 DRM 内容走 `MediaCodec` 的安全通路，只能出黑屏；设备静止时 scrcpy 不产生帧，帧率显示个位数属正常。
-
-## 文档
-
-- [docs/ios.md](docs/ios.md)：iPhone / iPad 的连接、键盘输入、工具栏与故障排查
-- [docs/debugging.md](docs/debugging.md)：各品牌安卓机开启 USB 调试
-- [THIRD-PARTY.md](THIRD-PARTY.md)：第三方组件与许可
-
-## 许可证
-
-MIT，见 [LICENSE](./LICENSE)；第三方组件见 [THIRD-PARTY.md](./THIRD-PARTY.md)。
+插件主体遵循 MIT 许可，见 [LICENSE](./LICENSE)；第三方组件许可见 [THIRD-PARTY.md](./THIRD-PARTY.md)。
