@@ -434,3 +434,217 @@ test('iOS decoded frames go to a video track instead of the canvas', async () =>
     engine.handle({ type: 'close' })
   }
 })
+
+test('external MediaStreamTrackGenerator writable drives video mode without VideoTrackGenerator and closes written frames', async () => {
+  const blits = []
+  const written = []
+  const messages = []
+  const decoded = []
+  let controller
+  const canvas = { width: 300, height: 150, getContext: () => ({
+    fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}, setTransform() {},
+    drawImage: (f, x, y, w, h) => blits.push([f.id, w, h])
+  }) }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async () => new Response(new ReadableStream({ start(c) { controller = c } })),
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage: (f, x, y, w, h) => blits.push([f.id, w, h]) } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        const id = chunk.data[0]
+        const f = { id, displayWidth: 1290, displayHeight: 2796, closed: 0, close() { this.closed += 1 } }
+        decoded.push(f)
+        this.output(f)
+      }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({
+    canvas,
+    post(message) { messages.push(message) }
+  })
+  const send = (...frames) => controller.enqueue(Buffer.concat(frames))
+  const video = (id, flags = 0) => frame(KIND.VIDEO, videoPayload(flags, id, Buffer.of(id)))
+  const writable = {
+    getWriter: () => ({
+      desiredSize: 2,
+      ready: Promise.resolve(),
+      write: (f) => { written.push(f.id); return Promise.resolve() }
+    })
+  }
+  engine.handle({ type: 'video-writable', writable })
+  engine.handle({ type: 'open', streamUrl: '/video' })
+  try {
+    send(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1290, height: 2796 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))), video(1, VIDEO_FLAGS.KEY), video(2))
+    for (let i = 0; i < 60 && written.length < 2; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.deepEqual(written, [1, 2])
+    assert.equal(blits.length, 0)
+    // 写入完成后显式释放本侧 VideoFrame 句柄，避免跨线程 WritableStream 克隆泄漏。
+    assert.deepEqual(decoded.map((f) => f.closed), [1, 1])
+    assert.ok(messages.some((m) => m.type === 'render-mode' && m.mode === 'video'))
+    // 断开重连复用同一条外部轨道写入端，仍保持 video 模式并重新上报几何。
+    engine.handle({ type: 'close' })
+    messages.length = 0
+    engine.handle({ type: 'open', streamUrl: '/video' })
+    send(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1290, height: 2796 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))), video(3, VIDEO_FLAGS.KEY))
+    for (let i = 0; i < 60 && written.length < 3; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.deepEqual(written, [1, 2, 3])
+    assert.ok(messages.some((m) => m.type === 'render-mode' && m.mode === 'video'))
+    assert.ok(messages.some((m) => m.type === 'geometry' && m.width === 1290 && m.height === 2796))
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+test('closed video writer falls back cleanly to canvas render mode', async () => {
+  const blits = []
+  const messages = []
+  let controller
+  const canvas = { width: 300, height: 150, getContext: () => ({
+    fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}, setTransform() {},
+    drawImage: (f, x, y, w, h) => blits.push([f.id, w, h])
+  }) }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async () => new Response(new ReadableStream({ start(c) { controller = c } })),
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage: (f, x, y, w, h) => blits.push([f.id, w, h]) } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode(chunk) {
+        const id = chunk.data[0]
+        this.output({ id, displayWidth: 1080, displayHeight: 1920, close() {} })
+      }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({ canvas, post: (m) => messages.push(m) })
+  const send = (...frames) => controller.enqueue(Buffer.concat(frames))
+  const video = (id, flags = 0) => frame(KIND.VIDEO, videoPayload(flags, id, Buffer.of(id)))
+  const writer = {
+    desiredSize: 1,
+    ready: Promise.resolve(),
+    write() {
+      this.desiredSize = null
+      return Promise.reject(new Error('stream closed'))
+    }
+  }
+  engine.handle({ type: 'video-writable', writable: { getWriter: () => writer } })
+  engine.handle({ type: 'open', streamUrl: '/video' })
+  try {
+    send(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1080, height: 1920 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))), video(1, VIDEO_FLAGS.KEY))
+    for (let i = 0; i < 30 && !messages.some((m) => m.type === 'render-mode' && m.mode === 'canvas'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.ok(messages.some((m) => m.type === 'render-mode' && m.mode === 'canvas'))
+    send(video(2))
+    for (let i = 0; i < 40 && blits.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.deepEqual(blits, [[2, 1080, 1920]])
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
+
+test('canvas fallback deduplicates identical size reports and direct stream reports stats independently', async () => {
+  const messages = []
+  let fakeNow = 1000
+  let hostController
+  let sidecarController
+  const canvas = { width: 300, height: 150, getContext: () => ({
+    fillRect() {}, save() {}, restore() {}, translate() {}, rotate() {}, setTransform() {},
+    drawImage() {}
+  }) }
+  const FakeDate = class extends Date {
+    static now() { return fakeNow }
+  }
+  const createEngine = runInNewContext(`${source}\ncreateMirrorEngine`, {
+    self: { atob }, Date: FakeDate, AbortController, TextDecoder, setTimeout, clearTimeout,
+    setInterval() { return 1 }, clearInterval() {},
+    requestAnimationFrame() { return 1 }, cancelAnimationFrame() {},
+    fetch: async (url) => {
+      const target = String(url)
+      if (target.endsWith('/codec')) {
+        return new Response(JSON.stringify({ display: { width: 1080, height: 1920, rotation: 0 } }))
+      }
+      return new Response(new ReadableStream({
+        start(c) {
+          if (target.endsWith('/stream.bin')) sidecarController = c
+          else hostController = c
+        }
+      }))
+    },
+    OffscreenCanvas: class {
+      constructor(width, height) { Object.assign(this, { width, height }) }
+      getContext() { return { drawImage() {} } }
+    },
+    EncodedVideoChunk: class { constructor(data) { Object.assign(this, data) } },
+    VideoDecoder: class {
+      constructor({ output }) { this.output = output }
+      configure() { this.state = 'configured' }
+      decode() { this.output({ displayWidth: 1080, displayHeight: 1920, close() {} }) }
+      close() { this.state = 'closed' }
+    }
+  })
+  const engine = createEngine({ canvas, post: (m) => messages.push(m) })
+  const sidecar = (type, body) => {
+    const prefix = Buffer.alloc(4)
+    prefix.writeUInt32BE(body.length + 1)
+    return Buffer.concat([prefix, Buffer.of(type), body])
+  }
+  engine.handle({
+    type: 'open', streamUrl: '/video',
+    directVideoUrl: 'http://127.0.0.1:49152/stream.bin'
+  })
+  try {
+    for (let i = 0; i < 20 && (!hostController || !sidecarController); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    hostController.enqueue(frame(KIND.META, Buffer.from(JSON.stringify({
+      type: 'meta', platform: 'ios', screen: { width: 1080, height: 1920 },
+      videoCodec: 'hvc1.test', videoDescription: 'AA=='
+    }))))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // 宿主流后续不再发任何字节，仅由直连流推帧并跨越 1 秒统计窗口。
+    sidecarController.enqueue(sidecar(2, Buffer.of(1)))
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    fakeNow = 2050
+    sidecarController.enqueue(sidecar(1, Buffer.of(2)))
+    for (let i = 0; i < 40 && !messages.some((m) => m.type === 'stats'); i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.ok(messages.some((m) => m.type === 'render-mode' && m.mode === 'canvas'))
+    assert.equal(messages.filter((m) => m.type === 'size').length, 1)
+    assert.ok(messages.some((m) => m.type === 'stats' && m.fps > 0))
+  } finally {
+    engine.handle({ type: 'close' })
+  }
+})
