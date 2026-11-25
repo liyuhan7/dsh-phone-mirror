@@ -59,10 +59,10 @@
   "scripts": {
     "build": "node scripts/build-client.mjs",
     "build:check": "node scripts/build-client.mjs --check",
-    "check": "node --check lib/index.js && node --check lib/core/frames.js && node --check lib/core/http.js && node --check lib/core/zip.js && node --check lib/providers/android/index.js && node --check lib/providers/ios/index.js && node --check lib/providers/ios/keymap.js && node --check lib/providers/ios/runtime.js && node --check lib/providers/ios/session.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && node --check lib/audio-worklet.js && node --check lib/engine.js && node --check lib/engine-worker.js && npm run build:check",
+    "check": "node --check lib/index.js && node --check lib/core/frames.js && node --check lib/core/http.js && node --check lib/core/zip.js && node --check lib/providers/android/index.js && node --check lib/providers/android/control.js && node --check lib/providers/android/direct-session.js && node --check lib/providers/android/direct-worker.js && node --check lib/providers/ios/index.js && node --check lib/providers/ios/keymap.js && node --check lib/providers/ios/runtime.js && node --check lib/providers/ios/session.js && node --check lib/session.js && node --check lib/adb.js && node --check lib/protocol.js && node --check lib/audio-worklet.js && node --check lib/engine.js && node --check lib/engine-worker.js && npm run build:check",
     "fetch:tools": "node scripts/fetch-tools.mjs",
     "build:ios-runtime": "node scripts/build-ios-runtime.mjs",
-    "test": "node scripts/ios-presenter.test.mjs && node scripts/ios-video.test.mjs && node scripts/ios-audio.test.mjs && node scripts/ios-wireless-host.test.mjs && node scripts/wireless-disconnect.test.mjs && node scripts/ios-runtime.test.mjs",
+    "test": "node scripts/ios-presenter.test.mjs && node scripts/ios-video.test.mjs && node scripts/ios-audio.test.mjs && node scripts/ios-wireless-host.test.mjs && node scripts/wireless-disconnect.test.mjs && node scripts/ios-runtime.test.mjs && node scripts/android-direct.test.mjs",
     "prepublishOnly": "npm run check && npm test"
   },
   "dsh": {
