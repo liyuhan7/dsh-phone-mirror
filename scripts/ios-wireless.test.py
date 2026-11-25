@@ -938,6 +938,104 @@ class WirelessTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 bridge._UDP_BYPASS.pop(41234, None)
 
+    async def test_handle_key_atomic_tap_taps_and_cleanup(self):
+        import json
+
+        sent = []
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._kb_service_id = 42
+        server._kb_uhs = SimpleNamespace(
+            send_keyboard=AsyncMock(side_effect=lambda sid, usages: sent.append((sid, list(usages))))
+        )
+        server._ensure_keyboard = AsyncMock()
+        server._detach_keyboard = AsyncMock()
+
+        with patch.object(bridge.asyncio, "sleep", AsyncMock()) as sleep_mock:
+            # 普通单键：按下 -> 8ms -> 抬起，抬起后不再多睡。
+            code, _ = await server._handle_key(json.dumps({"tap": [0x04]}).encode())
+            self.assertEqual(code, 200)
+            self.assertEqual(sent, [(42, [0x04]), (42, [])])
+            self.assertEqual([c.args[0] for c in sleep_mock.await_args_list], [0.008])
+
+            sent.clear()
+            sleep_mock.reset_mock()
+            # 带修饰键组合：修饰 -> 修饰+键 -> 键 -> 抬起，4 段原子发送。
+            code, _ = await server._handle_key(json.dumps({"tap": [0xE1, 0x04]}).encode())
+            self.assertEqual(code, 200)
+            self.assertEqual(sent, [(42, [0xE1]), (42, [0xE1, 0x04]), (42, [0x04]), (42, [])])
+            self.assertEqual([c.args[0] for c in sleep_mock.await_args_list], [0.010, 0.010, 0.010])
+
+            sent.clear()
+            sleep_mock.reset_mock()
+            # 批量 taps：顺序发送且字符间仅 6ms。
+            code, _ = await server._handle_key(json.dumps({"taps": [[0x04], [0x05]]}).encode())
+            self.assertEqual(code, 200)
+            self.assertEqual(sent, [(42, [0x04]), (42, []), (42, [0x05]), (42, [])])
+
+    async def test_handle_touch_closes_scroll_and_enforces_min_hold(self):
+        import json
+
+        events = []
+        now = 10.0
+
+        class FakeHandle:
+            def __init__(self):
+                self.cancelled = False
+
+            def cancel(self):
+                self.cancelled = True
+
+        server = object.__new__(bridge.MirrorScreenStreamServer)
+        server._hid_queue = asyncio.Queue()
+        server._hid_lock = asyncio.Lock()
+        server._touch_down = False
+        server._touch_down_at = 0.0
+        server._scroll_active = True
+        handle = FakeHandle()
+        server._scroll_end_handle = handle
+        server._ensure_hid_ready = AsyncMock()
+        server._hid_kick = lambda: None
+
+        async def fake_close_scroll():
+            server._scroll_active = False
+            events.append(("scroll_end", now))
+
+        server._close_scroll_gesture = fake_close_scroll
+
+        async def fake_super_touch(_self, body):
+            events.append((json.loads(body)["type"], now))
+            return 200, b"ok"
+
+        sleeps = []
+
+        async def fake_sleep(delay):
+            nonlocal now
+            sleeps.append(delay)
+            now += delay
+
+        fake_loop = SimpleNamespace(time=lambda: now)
+        with (
+            patch.object(bridge.ScreenStreamServer, "_handle_touch", fake_super_touch),
+            patch.object(bridge.asyncio, "get_running_loop", return_value=fake_loop),
+            patch.object(bridge.asyncio, "sleep", side_effect=fake_sleep),
+        ):
+            # 按下前先取消定时器并同步收口滚轮手势。
+            await server._handle_touch(json.dumps({"type": "contact", "x": 100, "y": 200}).encode())
+            self.assertTrue(handle.cancelled)
+            self.assertFalse(server._scroll_active)
+            self.assertEqual([e[0] for e in events], ["scroll_end", "contact"])
+
+            # 2ms 后立刻收到 release：自动补齐至 25ms 再发出。
+            now += 0.002
+            await server._handle_touch(json.dumps({"type": "release", "x": 100, "y": 200}).encode())
+            self.assertEqual([e[0] for e in events], ["scroll_end", "contact", "release"])
+            self.assertEqual(len(sleeps), 1)
+            self.assertAlmostEqual(sleeps[0], 0.023, places=6)
+
+            # _scroll_end 通过 _hid_queue 顺序入队，不再绕开队列并发抢锁。
+            server._scroll_end()
+            self.assertEqual(server._hid_queue.get_nowait(), ("/key", b'{"scroll_end":true}'))
+
 
 if __name__ == "__main__":
     unittest.main()

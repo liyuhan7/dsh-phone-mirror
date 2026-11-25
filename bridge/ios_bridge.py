@@ -116,8 +116,8 @@ from pymobiledevice3.remote.core_device.hid_service import (  # noqa: E402
     build_digitizer_report,
 )
 
-# 注册虚拟键盘后的挂载等待：0.12s 足够，缩短切回键盘时的首键延迟。
-hs.KEYBOARD_ATTACH_SETTLE_SECONDS = 0.12
+# 注册虚拟键盘后的挂载等待：避免附着尚未完成时首键携带 Shift/Cmd 导致修饰键粘滞。
+hs.KEYBOARD_ATTACH_SETTLE_SECONDS = 0.28
 from pymobiledevice3.remote.core_device.screen_stream import (  # noqa: E402
     ScreenStreamServer,
     hevc_decoder_configuration_record,
@@ -1022,6 +1022,8 @@ def _touch_op(body: bytes) -> str:
 class MirrorScreenStreamServer(ScreenStreamServer):
     _scroll_active = False
     _touch_down = False
+    _touch_down_at = 0.0
+    _MIN_TAP_HOLD_S = 0.025
     _scroll_end_handle = None
     # 键盘走独立 UHS 连接：点画面时只关这一条，触摸那条完全不受影响。
     _kb_uhs = None
@@ -1270,7 +1272,12 @@ class MirrorScreenStreamServer(ScreenStreamServer):
         self._touch_service_id = None
         self._scroll_active = False
         self._touch_down = False
+        self._touch_down_at = 0.0
         self._hid_ok_at = 0.0
+        scroll_end = getattr(self, "_scroll_end_handle", None)
+        if scroll_end is not None:
+            scroll_end.cancel()
+            self._scroll_end_handle = None
         for service in (uhs, indigo):
             if service is not None:
                 with contextlib.suppress(Exception):
@@ -1278,14 +1285,27 @@ class MirrorScreenStreamServer(ScreenStreamServer):
 
     async def _handle_touch(self, body: bytes) -> tuple[int, bytes]:
         op = _touch_op(body)
+        was_down = self._touch_down
         # 拖动中合并队列里连续积压的 contact 坐标，只发最新点，不丢起手和抬手。
-        if self._touch_down and op == "contact":
+        if was_down and op == "contact":
             queue = getattr(self, "_hid_queue", None)
             buf = getattr(queue, "_queue", None)
             while buf and buf[0][0] == "/touch" and _touch_op(buf[0][1]) == "contact":
                 body = queue.get_nowait()[1]
-        if not self._touch_down and op != "release":
+        if not was_down and op != "release":
+            # 新触摸起手前先收口活跃的滚轮手势，避免 Trackpad 态悬空拦截 SpringBoard 主屏点击。
+            if self._scroll_active:
+                scroll_end = getattr(self, "_scroll_end_handle", None)
+                if scroll_end is not None:
+                    scroll_end.cancel()
+                    self._scroll_end_handle = None
+                await self._close_scroll_gesture()
             await self._ensure_hid_ready()
+        if op == "release" and was_down and self._touch_down_at > 0.0:
+            # 防止探活或队列解堵导致 contact 与 release 微秒级背靠背发出被主界面当抖动滤掉。
+            elapsed = asyncio.get_running_loop().time() - self._touch_down_at
+            if elapsed < self._MIN_TAP_HOLD_S:
+                await asyncio.sleep(self._MIN_TAP_HOLD_S - elapsed)
         try:
             result = await super()._handle_touch(body)
         except Exception:
@@ -1295,8 +1315,11 @@ class MirrorScreenStreamServer(ScreenStreamServer):
             result = await super()._handle_touch(body)
         if op == "contact":
             self._touch_down = True
+            if not was_down:
+                self._touch_down_at = asyncio.get_running_loop().time()
         elif op in ("release", "tap"):
             self._touch_down = False
+            self._touch_down_at = 0.0
         # 发送后探活：死链在下一次输入到达前完成重建。
         self._hid_kick()
         return result
@@ -1351,7 +1374,11 @@ class MirrorScreenStreamServer(ScreenStreamServer):
 
     def _scroll_end(self) -> None:
         self._scroll_end_handle = None
-        asyncio.create_task(self._close_scroll_gesture())
+        queue = getattr(self, "_hid_queue", None)
+        if queue is not None:
+            queue.put_nowait(("/key", b'{"scroll_end":true}'))
+        else:
+            asyncio.create_task(self._close_scroll_gesture())
 
     async def _close_scroll_gesture(self) -> None:
         """收口滚动手势。
@@ -1405,6 +1432,7 @@ class MirrorScreenStreamServer(ScreenStreamServer):
     async def _stop_hid(self) -> None:
         self._scroll_active = False
         self._touch_down = False
+        self._touch_down_at = 0.0
         self._hid_ok_at = 0.0
         if self._motion_task is not None:
             self._motion_task.cancel()
@@ -1421,18 +1449,57 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                 await kb_uhs.close()
         await super()._stop_hid()
 
+    async def _send_keyboard_report(self, usages: list[int]) -> None:
+        await self._ensure_keyboard()
+        if self._kb_uhs is None or self._kb_service_id is None:
+            raise RuntimeError("keyboard unavailable")
+        try:
+            await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
+        except Exception:
+            # 键盘连接同样可能被网络抖动掐断，重建一次再发。
+            logging.info("keyboard send failed, rebuilding link", exc_info=True)
+            await self._detach_keyboard()
+            await self._ensure_keyboard()
+            if self._kb_uhs is None or self._kb_service_id is None:
+                raise RuntimeError("keyboard unavailable")
+            await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
+
+    async def _send_keyboard_tap(self, usages: list[int]) -> None:
+        if not usages:
+            return
+        mods = [usage for usage in usages if usage >= 0xE0]
+        keys = [usage for usage in usages if usage < 0xE0]
+        # 带修饰键按四段发送（修饰 → 修饰+键 → 键 → 抬起），避免修饰键粘滞。
+        chord = bool(mods and keys)
+        steps = [mods, list(usages), keys, []] if chord else [list(usages), []]
+        gap = 0.010 if chord else 0.008
+        pressed = False
+        try:
+            for index, step in enumerate(steps):
+                await self._send_keyboard_report(step)
+                pressed = bool(step)
+                if index < len(steps) - 1:
+                    await asyncio.sleep(gap)
+        finally:
+            if pressed and self._kb_uhs is not None and self._kb_service_id is not None:
+                with contextlib.suppress(Exception):
+                    await self._kb_uhs.send_keyboard(self._kb_service_id, [])
+
     async def _handle_key(self, body: bytes) -> tuple[int, bytes]:
         try:
             data = json.loads(body)
-            recents = data.get("recents") is True
-            scroll = data.get("scroll")
-        except (ValueError, AttributeError):
-            recents = False
-            scroll = None
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            return 400, f"invalid key request: {exc}".encode()
+        if not isinstance(data, dict):
+            return 400, b"invalid key request: object expected"
+        if data.get("scroll_end") is True:
+            await self._close_scroll_gesture()
+            return 200, b"ok"
+        scroll = data.get("scroll")
         if isinstance(scroll, dict):
             await self._send_scroll(scroll)
             return 200, b"ok"
-        if recents:
+        if data.get("recents") is True:
             # App 切换器 = 连按两次 Home（Consumer 页 0x0C / 用法 0x40）。
             await self._ensure_hid()
             indigo = self._indigo
@@ -1442,28 +1509,32 @@ class MirrorScreenStreamServer(ScreenStreamServer):
                 await indigo.send_button(0x0C, 0x40, HID_BUTTON_STATE_UP)
                 await asyncio.sleep(0.12)
             return 200, b"ok"
-        # 普通按键：键盘在独立连接上（见 _ensure_keyboard），点过画面后首键会重新注册。
+        # 普通按键：支持单次原子按压（tap / taps）与原始状态快照（usages）。
+        taps = data.get("taps")
+        tap = data.get("tap")
         try:
-            usages = [int(value) for value in json.loads(body).get("usages", [])]
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            if taps is not None:
+                parsed_taps = [[int(value) for value in item] for item in taps]
+            elif tap is not None:
+                parsed_taps = [[int(value) for value in tap]]
+            else:
+                parsed_taps = None
+                usages = [int(value) for value in data.get("usages", [])]
+        except (TypeError, ValueError) as exc:
             return 400, f"invalid key request: {exc}".encode()
         try:
-            await self._ensure_keyboard()
+            if parsed_taps is not None:
+                for index, item in enumerate(parsed_taps):
+                    if not item:
+                        continue
+                    await self._send_keyboard_tap(item)
+                    if index < len(parsed_taps) - 1:
+                        await asyncio.sleep(0.006)
+            else:
+                await self._send_keyboard_report(usages)
         except Exception:
-            logging.warning("keyboard attach failed", exc_info=True)
+            logging.warning("keyboard send failed", exc_info=True)
             return 503, b"keyboard unavailable"
-        if self._kb_uhs is None or self._kb_service_id is None:
-            return 503, b"keyboard unavailable"
-        try:
-            await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
-        except Exception:
-            # 键盘连接同样可能被网络抖动掐断，重建一次再发。
-            logging.info("keyboard send failed, rebuilding link", exc_info=True)
-            await self._detach_keyboard()
-            await self._ensure_keyboard()
-            if self._kb_uhs is None or self._kb_service_id is None:
-                return 503, b"keyboard unavailable"
-            await self._kb_uhs.send_keyboard(self._kb_service_id, usages)
         return 200, b"ok"
 
 
@@ -1552,10 +1623,12 @@ async def cmd_serve(udid: str, port: int, wireless: bool, host: str = "", *, exp
             "connection": "wifi" if wireless else "usb",
             "audio": _aac_eld_supported(),
         })
-        # HID 预热放到就绪之后，不阻塞首帧。
+        # HID 与键盘连接预热放到就绪之后，不阻塞首帧；预热键盘连接不注册虚拟键盘，不影响手机软键盘。
         async def warm_hid() -> None:
             with contextlib.suppress(Exception):
                 await server._ensure_hid()
+            with contextlib.suppress(Exception):
+                await server._warm_keyboard_link()
 
         hid_warm = asyncio.create_task(warm_hid())
         address_task = asyncio.create_task(_learn_wireless_after_delay(udid)) if not wireless else None
